@@ -15,6 +15,99 @@ cargo run --release -- --screenshot shots/ song.mp3   # headless render of all w
 cargo run --release -- --selftest song.mp3 other.flac # scripted UI self-test
 ```
 
+## Install
+
+Prebuilt binaries are not published yet; build from source with a Rust
+toolchain (1.88 or newer) from <https://rustup.rs>. All platforms:
+
+```
+git clone https://github.com/patrickisgreat/winamp-rust.git
+cd winamp-rust
+cargo install --path crates/winamp-app     # puts `winamp` in ~/.cargo/bin
+winamp ~/Music                             # or just `winamp`
+```
+
+`cargo run --release` works from the checkout without installing.
+
+### macOS (12 Monterey or newer, Intel and Apple Silicon)
+
+No extra libraries are needed: audio goes through CoreAudio and the file
+dialogs are native. To get a double-clickable `Winamp.app` with an icon and
+file associations for audio files, playlists and `.wsz` skins:
+
+```
+scripts/make-app.sh                 # installs into /Applications
+scripts/make-app.sh ~/Applications  # or a folder of your choice
+```
+
+If Xcode's command line tools are missing, run `xcode-select --install`
+first (the script uses `sips` and `iconutil`).
+
+### Linux
+
+Install the development packages for ALSA (audio output), GTK 3 (file
+dialogs) and the windowing libraries, then build as above.
+
+Debian / Ubuntu:
+
+```
+sudo apt install build-essential pkg-config libasound2-dev libgtk-3-dev \
+  libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev \
+  libxcb-xfixes0-dev
+```
+
+Fedora:
+
+```
+sudo dnf install gcc pkgconf-pkg-config alsa-lib-devel gtk3-devel \
+  libxkbcommon-devel wayland-devel libxcb-devel
+```
+
+Arch:
+
+```
+sudo pacman -S --needed base-devel alsa-lib gtk3 libxkbcommon wayland libxcb
+```
+
+Both Wayland and X11 are supported. PipeWire and PulseAudio systems work
+through their ALSA compatibility layer. Settings end up in
+`~/.config/winamp-rust/Winamp/` (or `$XDG_CONFIG_HOME`).
+
+### Windows (10 or newer)
+
+Install Rust with the default `x86_64-pc-windows-msvc` toolchain, which also
+prompts for the Visual Studio C++ build tools. Then, in a developer or regular
+PowerShell:
+
+```
+cargo install --path crates\winamp-app
+winamp
+```
+
+Audio uses WASAPI and no additional libraries are required. Release builds
+start without a console window. Settings live in
+`%APPDATA%\winamp-rust\Winamp\config\`.
+
+### Where files live
+
+| Platform | Settings and playlist | Skins folder |
+|----------|----------------------|--------------|
+| macOS | `~/Library/Application Support/org.winamp-rust.Winamp/` | `.../Skins/` |
+| Linux | `~/.config/winamp-rust/Winamp/` | `.../Skins/` |
+| Windows | `%APPDATA%\winamp-rust\Winamp\config\` | `...\Skins\` |
+
+Drop classic `.wsz` / `.zip` skins (or unpacked skin folders) into the skins
+folder; Preferences > Skins has an "Open skins folder" button.
+
+### Developing
+
+```
+cargo test --workspace                       # unit tests for every crate
+cargo clippy --workspace --all-targets       # lint (the tree is kept warning-free)
+cargo fmt --all                              # format
+cargo run -- --selftest a.wav b.wav c.wav    # scripted UI check, needs 3+ audio files
+```
+
 ## Features
 
 * Main window: transport buttons, LCD time (elapsed/remaining, blinks when
@@ -33,10 +126,11 @@ cargo run --release -- --selftest song.mp3 other.flac # scripted UI self-test
   windowshade mode, file info.
 * Skins: classic `.wsz`/`.zip` or unpacked folders, with `pledit.txt` and
   `viscolor.txt`. Missing bitmaps fall back to the built-in skin. A procedural
-  base skin plus the DMT and Liminal themes are generated at runtime; `--install-theme`
+  base skin plus the DMT, Liminal and No Man's Sky themes are generated at runtime; `--install-theme`
   writes a real `.wsz` into the skins folder.
 * Windows snap to each other and to the screen edges; EQ and playlist docked
-  to the main window move with it. Shift while dragging disables snapping.
+  to the main window move with it, and "Lock windows together" (default on)
+  moves all windows as one. Shift while dragging disables snapping.
 * Formats: MP3, MP2, AAC/M4A, FLAC, Ogg Vorbis, WAV, AIFF, ALAC, audio in
   MKV/WebM. HTTP/HTTPS streams with ICY "now playing" titles; remote `.pls`
   and `.m3u` are expanded.
@@ -68,3 +162,9 @@ Preferences > Hotkeys. On macOS the Command key works wherever Ctrl is listed.
 * `crates/winamp-skin`: skin loading, sprite catalogue, procedural themes.
 * `crates/winamp-app`: the eframe application, windows, dialogs, hotkeys,
   headless renderer and self-test.
+
+## macOS app bundle
+
+`scripts/make-app.sh` builds the release binary, renders an icon, wraps
+everything in `Winamp.app` (with file associations for audio, playlists and
+`.wsz` skins) and installs it into `/Applications` (or `~/Applications`).

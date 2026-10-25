@@ -5,8 +5,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::default::{self, Theme, BASE_THEME};
+use crate::default::{self, Canvas, Theme, BASE_THEME};
 use crate::{Skin, SkinImage};
+
+#[allow(unused_imports)]
+use std::f32::consts::FRAC_PI_3;
 
 type C = [u8; 3];
 
@@ -59,20 +62,25 @@ fn dmt_pattern(x: i32, y: i32, dim: bool) -> C {
     let ring_i = ring.floor();
     let ring_f = ring - ring_i;
     let edge = (ring_f - 0.5).abs() * 2.0; // 1.0 on ring borders
-    // Triangle lattice in three directions.
-    let lattice = [0.0f32, 1.047_197_6, 2.094_395_2]
-        .iter()
-        .map(|th| {
-            let d = (u * th.cos() + v * th.sin()) / 8.0;
-            let f = d - d.floor();
-            (f - 0.5).abs() * 2.0
-        })
-        .fold(0.0f32, |m, e| m.max(e));
+                                           // Triangle lattice in three directions.
+    let lattice = [
+        0.0f32,
+        std::f32::consts::FRAC_PI_3,
+        2.0 * std::f32::consts::FRAC_PI_3,
+    ]
+    .iter()
+    .map(|th| {
+        let d = (u * th.cos() + v * th.sin()) / 8.0;
+        let f = d - d.floor();
+        (f - 0.5).abs() * 2.0
+    })
+    .fold(0.0f32, |m, e| m.max(e));
     // Radial spokes every 30 degrees and a central star.
     let spokes = ((a * 6.0).sin()).abs();
     let star = (((a * 3.0).cos() * r / 9.0).sin()).abs();
     let hue = 290.0 + ring_i * 55.0 + (fx * 0.35) + (fy * 0.2) + r * 1.5;
-    let neon = edge > 0.84 || lattice > 0.93 || (spokes < 0.06 && r > 4.0) || (star > 0.985 && r < 20.0);
+    let neon =
+        edge > 0.84 || lattice > 0.93 || (spokes < 0.06 && r > 4.0) || (star > 0.985 && r < 20.0);
     let glow = edge.max(lattice).powf(6.0) * 0.35 + (1.0 - (r / 30.0).min(1.0)) * 0.12;
     let (sat, val) = if neon {
         (0.9, if dim { 0.72 } else { 1.0 })
@@ -105,7 +113,36 @@ pub const DMT_THEME: Theme = Theme {
     grad_hi: [255, 225, 0],
     pledit_txt: DMT_PLEDIT_TXT,
     viscolor_txt: DMT_VISCOLOR_TXT,
+    title_main: "D M T",
+    title_eq: "DMT EQUALIZER",
+    title_pl: "DMT PLAYLIST",
+    title_color: [255, 232, 120],
+    emblem: Some(dmt_emblem),
+    flat: false,
+    decorate: None,
 };
+
+/// Hexagram emblem.
+fn dmt_emblem(c: &mut Canvas, x: i32, y: i32) {
+    let a = [255, 0, 255];
+    let b = [0, 255, 200];
+    // upward triangle
+    c.hline(x, y + 7, 9, a);
+    for i in 0..4 {
+        c.px(x + 4 - i, y + 1 + i * 2, a);
+        c.px(x + 4 - i, y + 2 + i * 2, a);
+        c.px(x + 4 + i, y + 1 + i * 2, a);
+        c.px(x + 4 + i, y + 2 + i * 2, a);
+    }
+    // downward triangle
+    c.hline(x, y + 1, 9, b);
+    for i in 0..4 {
+        c.px(x + 4 - i, y + 7 - i * 2, b);
+        c.px(x + 4 - i, y + 6 - i * 2, b);
+        c.px(x + 4 + i, y + 7 - i * 2, b);
+        c.px(x + 4 + i, y + 6 - i * 2, b);
+    }
+}
 
 pub const LIMINAL_PLEDIT_TXT: &str = "[Text]\nNormal=#6E6248\nCurrent=#1E1A12\nNormalBG=#D9C98C\nSelectedBG=#BCAA6E\nmbFG=#6E6248\nmbBG=#D9C98C\nFont=Arial\n";
 pub const LIMINAL_VISCOLOR_TXT: &str = "42,46,36\n58,62,50\n246,244,220\n240,238,210\n232,230,196\n224,222,184\n214,212,172\n204,204,160\n192,196,150\n180,188,140\n168,180,130\n156,172,122\n144,164,114\n132,156,106\n120,146,98\n108,136,90\n96,126,82\n84,116,74\n236,236,220\n220,220,204\n200,200,186\n180,182,168\n160,162,150\n250,250,230\n";
@@ -125,14 +162,23 @@ fn liminal_pattern(x: i32, y: i32, dim: bool) -> C {
     // Base wallpaper with soft vertical stripes.
     let stripe = ((fx / 6.0).sin() * 0.5 + 0.5) * 0.06 + ((fx / 23.0).cos() * 0.5 + 0.5) * 0.04;
     // Low-frequency stains.
-    let stain = ((fx / 37.0).sin() * (fy / 29.0).cos() + (fx / 61.0 + fy / 17.0).sin() * 0.6) * 0.07;
+    let stain =
+        ((fx / 37.0).sin() * (fy / 29.0).cos() + (fx / 61.0 + fy / 17.0).sin() * 0.6) * 0.07;
     // Fluorescent light bleeding down from the ceiling.
     let glow = (1.0 - (fy / 60.0).min(1.0)) * 0.10;
     // Grain.
     let grain = (hash01(x, y) - 0.5) * 0.05;
     // Drop-ceiling grid lines every 24 px, faint.
-    let grid = if x.rem_euclid(24) == 0 || y.rem_euclid(24) == 0 { -0.08 } else { 0.0 };
-    let base: [f32; 3] = if dim { [0.74, 0.68, 0.46] } else { [0.85, 0.79, 0.55] };
+    let grid = if x.rem_euclid(24) == 0 || y.rem_euclid(24) == 0 {
+        -0.08
+    } else {
+        0.0
+    };
+    let base: [f32; 3] = if dim {
+        [0.74, 0.68, 0.46]
+    } else {
+        [0.85, 0.79, 0.55]
+    };
     let k = 1.0 + stripe + stain + glow + grain + grid;
     let warm = glow * 0.6; // the light is slightly green-white
     [
@@ -165,14 +211,38 @@ pub const LIMINAL_THEME: Theme = Theme {
     grad_hi: [214, 150, 96],
     pledit_txt: LIMINAL_PLEDIT_TXT,
     viscolor_txt: LIMINAL_VISCOLOR_TXT,
+    title_main: "LIMINAL SPACES",
+    title_eq: "LIMINAL EQUALIZER",
+    title_pl: "LIMINAL PLAYLIST",
+    title_color: [66, 56, 38],
+    emblem: Some(liminal_emblem),
+    flat: false,
+    decorate: None,
 };
+
+/// Green "EXIT" sign emblem.
+fn liminal_emblem(c: &mut Canvas, x: i32, y: i32) {
+    c.fill(x, y + 1, 9, 7, [36, 120, 70]);
+    c.outline(x, y + 1, 9, 7, [220, 240, 200]);
+    // running figure: a dot head and a slanted body
+    c.px(x + 4, y + 3, [230, 255, 220]);
+    c.px(x + 4, y + 4, [230, 255, 220]);
+    c.px(x + 3, y + 5, [230, 255, 220]);
+    c.px(x + 5, y + 5, [230, 255, 220]);
+    c.px(x + 2, y + 6, [230, 255, 220]);
+    c.px(x + 6, y + 6, [230, 255, 220]);
+}
 
 pub const NMS_PLEDIT_TXT: &str = "[Text]\nNormal=#DCE6F0\nCurrent=#FF8A3C\nNormalBG=#121832\nSelectedBG=#1E5A78\nmbFG=#DCE6F0\nmbBG=#121832\nFont=Arial\n";
 pub const NMS_VISCOLOR_TXT: &str = "10,12,30\n30,36,70\n255,80,110\n255,96,100\n255,116,88\n255,138,76\n255,160,66\n255,182,60\n250,200,70\n236,214,90\n210,222,120\n176,226,150\n140,226,180\n110,222,200\n84,216,212\n66,208,220\n56,196,226\n50,180,230\n255,255,255\n220,240,250\n180,225,240\n140,210,230\n110,195,220\n255,230,120\n";
 
 fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     let t = t.clamp(0.0, 1.0);
-    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+    ]
 }
 
 /// Distance to the nearest edge of a pointy-top hexagon grid with the given radius.
@@ -180,12 +250,20 @@ fn hex_edge_dist(x: f32, y: f32, radius: f32) -> f32 {
     let w = radius * 1.732_050_8;
     let h = radius * 1.5;
     let row = (y / h).floor();
-    let xo = if (row as i32).rem_euclid(2) == 0 { 0.0 } else { w / 2.0 };
+    let xo = if (row as i32).rem_euclid(2) == 0 {
+        0.0
+    } else {
+        w / 2.0
+    };
     let mut best = f32::MAX;
     for dr in -1..=1 {
         for dc in -1..=1 {
             let r = row + dr as f32;
-            let off = if (r as i32).rem_euclid(2) == 0 { 0.0 } else { w / 2.0 };
+            let off = if (r as i32).rem_euclid(2) == 0 {
+                0.0
+            } else {
+                w / 2.0
+            };
             let c = ((x - off) / w).floor() + dc as f32;
             let cx = c * w + off + w / 2.0;
             let cy = r * h + radius;
@@ -209,24 +287,56 @@ fn hex_dist_pointy(x: f32, y: f32) -> f32 {
 fn nms_pattern(x: i32, y: i32, dim: bool) -> C {
     let (fx, fy) = (x as f32, y as f32);
     // Nebula: coral/magenta in the upper left drifting to teal/navy lower right.
-    let n = ((fx / 48.0).sin() * (fy / 31.0).cos() + (fx / 23.0 + fy / 41.0).sin() * 0.6 + ((fx + fy) / 90.0).cos() * 0.8) * 0.5 + 0.5;
+    let n = ((fx / 48.0).sin() * (fy / 31.0).cos()
+        + (fx / 23.0 + fy / 41.0).sin() * 0.6
+        + ((fx + fy) / 90.0).cos() * 0.8)
+        * 0.5
+        + 0.5;
     let t = ((fx / 275.0) * 0.6 + (fy / 116.0) * 0.4).clamp(0.0, 1.0);
     let navy = [0.07, 0.08, 0.22];
     let purple = [0.36, 0.10, 0.42];
     let coral = [0.95, 0.38, 0.40];
     let teal = [0.10, 0.55, 0.62];
-    let sky = lerp3(lerp3(coral, purple, t * 1.4), lerp3(purple, teal, (t - 0.4) * 1.7), t);
+    let sky = lerp3(
+        lerp3(coral, purple, t * 1.4),
+        lerp3(purple, teal, (t - 0.4) * 1.7),
+        t,
+    );
     let mut c = lerp3(navy, sky, n * 0.75);
-    // Banded low-poly planet in the lower right.
-    let (pcx, pcy, pr) = (296.0, 150.0, 96.0);
+    // Banded low-poly planet dominating the right side, plus a small moon.
+    let (pcx, pcy, pr) = (232.0, 78.0, 74.0);
     let d = ((fx - pcx).powi(2) + (fy - pcy).powi(2)).sqrt();
-    if d < pr {
+    let (mcx, mcy, mr) = (62.0, 98.0, 15.0);
+    let md = ((fx - mcx).powi(2) + (fy - mcy).powi(2)).sqrt();
+    if md < mr {
+        let shade = 0.45 + 0.55 * (1.0 - md / mr).sqrt();
+        let crater = if ((fx - mcx + 4.0).powi(2) + (fy - mcy - 3.0).powi(2)).sqrt() < 4.0 {
+            0.7
+        } else {
+            1.0
+        };
+        c = [
+            0.78 * shade * crater,
+            0.74 * shade * crater,
+            0.70 * shade * crater,
+        ];
+    } else if d < pr {
         let band = (((fy - pcy) + (fx - pcx) * 0.35) / 9.0).floor() as i32;
-        let palette = [[0.98, 0.56, 0.22], [0.92, 0.40, 0.30], [0.96, 0.72, 0.30], [0.30, 0.72, 0.70], [0.86, 0.46, 0.60]];
+        let palette = [
+            [0.98, 0.56, 0.22],
+            [0.92, 0.40, 0.30],
+            [0.96, 0.72, 0.30],
+            [0.30, 0.72, 0.70],
+            [0.86, 0.46, 0.60],
+        ];
         let pc = palette[band.rem_euclid(palette.len() as i32) as usize];
         let shade = 0.55 + 0.45 * (1.0 - d / pr).sqrt();
         let rim = if d > pr - 2.0 { 1.3 } else { 1.0 };
-        c = [pc[0] * shade * rim, pc[1] * shade * rim, pc[2] * shade * rim];
+        c = [
+            pc[0] * shade * rim,
+            pc[1] * shade * rim,
+            pc[2] * shade * rim,
+        ];
     } else if d < pr + 6.0 {
         // atmosphere glow
         let g = 1.0 - (d - pr) / 6.0;
@@ -242,13 +352,19 @@ fn nms_pattern(x: i32, y: i32, dim: bool) -> C {
             c = [1.0, 0.95, 0.85];
         }
     }
-    // Hex interface grid, faint cyan.
-    let e = hex_edge_dist(fx, fy, 11.0);
-    if e < 0.7 {
-        c = lerp3(c, [0.45, 0.85, 0.95], 0.28);
+    // Hex interface grid, faint cyan, only over open sky.
+    if d >= pr && md >= mr {
+        let e = hex_edge_dist(fx, fy, 11.0);
+        if e < 0.7 {
+            c = lerp3(c, [0.45, 0.85, 0.95], 0.22);
+        }
     }
     let k = if dim { 0.62 } else { 1.0 };
-    [((c[0] * k).clamp(0.0, 1.0) * 255.0) as u8, ((c[1] * k).clamp(0.0, 1.0) * 255.0) as u8, ((c[2] * k).clamp(0.0, 1.0) * 255.0) as u8]
+    [
+        ((c[0] * k).clamp(0.0, 1.0) * 255.0) as u8,
+        ((c[1] * k).clamp(0.0, 1.0) * 255.0) as u8,
+        ((c[2] * k).clamp(0.0, 1.0) * 255.0) as u8,
+    ]
 }
 
 pub const NMS_THEME: Theme = Theme {
@@ -274,14 +390,104 @@ pub const NMS_THEME: Theme = Theme {
     grad_hi: [255, 70, 90],
     pledit_txt: NMS_PLEDIT_TXT,
     viscolor_txt: NMS_VISCOLOR_TXT,
+    title_main: "NO MAN'S SKY",
+    title_eq: "NO MAN'S SKY - EQUALIZER",
+    title_pl: "NMS PLAYLIST",
+    title_color: [255, 138, 60],
+    emblem: Some(nms_emblem),
+    flat: true,
+    decorate: Some(nms_decorate),
 };
+
+/// Large Atlas emblem: nested diamonds with a glowing core.
+fn nms_atlas(c: &mut Canvas, x: i32, y: i32, r: i32) {
+    let o = [255, 122, 58];
+    let w = [255, 240, 220];
+    let dim = [160, 70, 40];
+    for i in 0..=r {
+        c.px(x + r - i, y + i, o);
+        c.px(x + r + i, y + i, o);
+        c.px(x + r - i, y + 2 * r - i, o);
+        c.px(x + r + i, y + 2 * r - i, o);
+    }
+    let r2 = r * 2 / 3;
+    for i in 0..=r2 {
+        c.px(x + r - i, y + r - r2 + i, dim);
+        c.px(x + r + i, y + r - r2 + i, dim);
+        c.px(x + r - i, y + r + r2 - i, dim);
+        c.px(x + r + i, y + r + r2 - i, dim);
+    }
+    // inner triangle
+    let r3 = r / 2;
+    for i in 0..=r3 {
+        c.hline(
+            x + r - i,
+            y + r - r3 / 2 + i,
+            2 * i + 1,
+            if i == r3 { o } else { w },
+        );
+    }
+}
+
+/// Artwork overlays: wordmark, big emblem, EQ/playlist branding.
+fn nms_decorate(c: &mut Canvas, which: SkinImage) {
+    let orange = [255, 138, 60];
+    let white = [248, 242, 232];
+    let dark = [10, 12, 30];
+    match which {
+        SkinImage::Main => {
+            // Big Atlas emblem in the free corner right of the repeat button.
+            nms_atlas(c, 243, 84, 14);
+            // Wordmark along the bottom edge.
+            c.fill(13, 106, 98, 10, dark);
+            c.text3_scaled(14, 106, "NO MAN'S SKY", orange, 2);
+            // Thin accent rails on the left strip.
+            c.vline(2, 16, 98, orange);
+            c.vline(4, 16, 98, [120, 60, 30]);
+            c.text3(118, 108, "ATLAS RISES", [186, 206, 224]);
+        }
+        SkinImage::EqMain => {
+            c.fill(9, 30, 50, 7, dark);
+            c.text3(10, 31, "NO MAN'S SKY", orange);
+            nms_atlas(c, 2, 16, 3);
+            c.vline(272, 16, 98, orange);
+        }
+        SkinImage::PlEdit => {
+            // Bottom-left corner (0,72): emblem beside the buttons' groove.
+            nms_atlas(c, 1, 73, 4);
+            // Bottom-left corner (0,72): wordmark in the free row above the buttons.
+            c.fill(11, 72 + 8, 50, 7, dark);
+            c.text3(12, 72 + 9, "NO MAN'S SKY", orange);
+            let _ = white;
+        }
+        _ => {}
+    }
+}
+
+/// Atlas emblem: an orange diamond with a white inner triangle.
+fn nms_emblem(c: &mut Canvas, x: i32, y: i32) {
+    let o = [255, 122, 58];
+    let w = [255, 240, 220];
+    for i in 0..5 {
+        c.px(x + 4 - i, y + i, o);
+        c.px(x + 4 + i, y + i, o);
+        c.px(x + 4 - i, y + 8 - i, o);
+        c.px(x + 4 + i, y + 8 - i, o);
+    }
+    c.px(x + 4, y + 3, w);
+    c.hline(x + 3, y + 4, 3, w);
+    c.hline(x + 2, y + 5, 5, w);
+}
 
 pub fn all() -> Vec<&'static Theme> {
     vec![&BASE_THEME, &DMT_THEME, &LIMINAL_THEME, &NMS_THEME]
 }
 
 pub fn by_name(name: &str) -> Option<&'static Theme> {
-    all().into_iter().find(|t| t.name.eq_ignore_ascii_case(name) || t.name.trim_matches(['<', '>']).eq_ignore_ascii_case(name))
+    all().into_iter().find(|t| {
+        t.name.eq_ignore_ascii_case(name)
+            || t.name.trim_matches(['<', '>']).eq_ignore_ascii_case(name)
+    })
 }
 
 pub fn generate(theme: &Theme) -> Skin {
@@ -293,9 +499,11 @@ pub fn write_wsz(skin: &Skin, pledit_txt: &str, viscolor_txt: &str, path: &Path)
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let file = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let file =
+        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
     let mut zip = zip::ZipWriter::new(file);
-    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
     for which in SkinImage::ALL {
         let img = image::DynamicImage::ImageRgba8(skin.image(which).clone()).to_rgb8();
         let mut bytes = std::io::Cursor::new(Vec::new());
@@ -316,7 +524,12 @@ pub fn write_wsz(skin: &Skin, pledit_txt: &str, viscolor_txt: &str, path: &Path)
 /// Generate a theme and write it as NAME.wsz into `dir`. Returns the path.
 pub fn install(theme: &Theme, dir: &Path) -> Result<std::path::PathBuf> {
     let skin = generate(theme);
-    let file_name: String = theme.name.trim_matches(['<', '>']).chars().filter(|c| c.is_alphanumeric() || *c == ' ').collect();
+    let file_name: String = theme
+        .name
+        .trim_matches(['<', '>'])
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == ' ')
+        .collect();
     let path = dir.join(format!("{}.wsz", file_name.replace(' ', "")));
     write_wsz(&skin, theme.pledit_txt, theme.viscolor_txt, &path)?;
     Ok(path)

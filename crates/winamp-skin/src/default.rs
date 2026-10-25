@@ -9,7 +9,8 @@ use image::{Rgba, RgbaImage};
 use crate::font;
 use crate::{PleditColors, Skin, SkinImage, VisColors};
 
-pub const PLEDIT_TXT: &str = "[Text]\nNormal=#00FF00\nCurrent=#FFFFFF\nNormalBG=#000000\nSelectedBG=#0000C6\nFont=Arial\n";
+pub const PLEDIT_TXT: &str =
+    "[Text]\nNormal=#00FF00\nCurrent=#FFFFFF\nNormalBG=#000000\nSelectedBG=#0000C6\nFont=Arial\n";
 pub const VISCOLOR_TXT: &str = "0,0,0\n24,33,41\n239,49,16\n206,41,16\n214,90,0\n214,102,0\n214,115,0\n198,123,8\n222,165,24\n214,181,33\n189,222,41\n148,222,33\n41,206,16\n50,190,16\n57,181,16\n49,156,8\n41,148,0\n24,132,8\n255,255,255\n214,214,222\n181,189,189\n160,170,175\n148,156,165\n150,150,150\n";
 
 type C = [u8; 3];
@@ -41,6 +42,18 @@ pub struct Theme {
     pub grad_hi: C,
     pub pledit_txt: &'static str,
     pub viscolor_txt: &'static str,
+    /// Title bar texts for the main, equalizer and playlist windows.
+    pub title_main: &'static str,
+    pub title_eq: &'static str,
+    pub title_pl: &'static str,
+    /// Title text color.
+    pub title_color: C,
+    /// Optional 9x9 emblem drawn left of the title text.
+    pub emblem: Option<fn(&mut Canvas, i32, i32)>,
+    /// Flat "HUD" widget style: translucent chamfered panels instead of bevels.
+    pub flat: bool,
+    /// Extra artwork drawn over a finished bitmap.
+    pub decorate: Option<fn(&mut Canvas, SkinImage)>,
 }
 
 pub const BASE_THEME: Theme = Theme {
@@ -66,6 +79,13 @@ pub const BASE_THEME: Theme = Theme {
     grad_hi: [240, 40, 0],
     pledit_txt: PLEDIT_TXT,
     viscolor_txt: VISCOLOR_TXT,
+    title_main: "WINAMP",
+    title_eq: "WINAMP EQUALIZER",
+    title_pl: "PLAYLIST EDITOR",
+    title_color: [214, 218, 232],
+    emblem: None,
+    flat: false,
+    decorate: None,
 };
 
 /// Tiny 3x5 font for small labels.
@@ -116,9 +136,11 @@ fn mini_glyph(c: char) -> [&'static str; 5] {
     }
 }
 
-struct Canvas {
+pub struct Canvas {
     img: RgbaImage,
     t: Theme,
+    /// Offset added to pattern coordinates so sprites continue the window artwork.
+    pub origin: (i32, i32),
 }
 
 impl Canvas {
@@ -127,7 +149,11 @@ impl Canvas {
         for p in img.pixels_mut() {
             *p = Rgba([c[0], c[1], c[2], 255]);
         }
-        let mut cv = Self { img, t: *t };
+        let mut cv = Self {
+            img,
+            t: *t,
+            origin: (0, 0),
+        };
         if c == t.bg && t.pattern.is_some() {
             cv.fill_bg(0, 0, w as i32, h as i32, false);
         }
@@ -138,9 +164,10 @@ impl Canvas {
     fn fill_bg(&mut self, x: i32, y: i32, w: i32, h: i32, dim: bool) {
         match self.t.pattern {
             Some(f) => {
+                let (ox, oy) = self.origin;
                 for yy in y..y + h {
                     for xx in x..x + w {
-                        self.px(xx, yy, f(xx, yy, dim));
+                        self.px(xx, yy, f(xx + ox, yy + oy, dim));
                     }
                 }
             }
@@ -148,13 +175,14 @@ impl Canvas {
         }
     }
 
-    fn px(&mut self, x: i32, y: i32, c: C) {
+    pub fn px(&mut self, x: i32, y: i32, c: C) {
         if x >= 0 && y >= 0 && (x as u32) < self.img.width() && (y as u32) < self.img.height() {
-            self.img.put_pixel(x as u32, y as u32, Rgba([c[0], c[1], c[2], 255]));
+            self.img
+                .put_pixel(x as u32, y as u32, Rgba([c[0], c[1], c[2], 255]));
         }
     }
 
-    fn fill(&mut self, x: i32, y: i32, w: i32, h: i32, c: C) {
+    pub fn fill(&mut self, x: i32, y: i32, w: i32, h: i32, c: C) {
         for yy in y..y + h {
             for xx in x..x + w {
                 self.px(xx, yy, c);
@@ -162,33 +190,107 @@ impl Canvas {
         }
     }
 
-    fn hline(&mut self, x: i32, y: i32, w: i32, c: C) {
+    pub fn hline(&mut self, x: i32, y: i32, w: i32, c: C) {
         self.fill(x, y, w, 1, c);
     }
 
-    fn vline(&mut self, x: i32, y: i32, h: i32, c: C) {
+    pub fn vline(&mut self, x: i32, y: i32, h: i32, c: C) {
         self.fill(x, y, 1, h, c);
     }
 
-    fn outline(&mut self, x: i32, y: i32, w: i32, h: i32, c: C) {
+    pub fn outline(&mut self, x: i32, y: i32, w: i32, h: i32, c: C) {
         self.hline(x, y, w, c);
         self.hline(x, y + h - 1, w, c);
         self.vline(x, y, h, c);
         self.vline(x + w - 1, y, h, c);
     }
 
+    /// Multiply the existing pixels in a rectangle by `k` (translucent panels).
+    pub fn darken(&mut self, x: i32, y: i32, w: i32, h: i32, k: f32) {
+        for yy in y.max(0)..(y + h).min(self.img.height() as i32) {
+            for xx in x.max(0)..(x + w).min(self.img.width() as i32) {
+                let p = self.img.get_pixel(xx as u32, yy as u32);
+                let c = [
+                    (p[0] as f32 * k) as u8,
+                    (p[1] as f32 * k) as u8,
+                    (p[2] as f32 * k) as u8,
+                ];
+                self.px(xx, yy, c);
+            }
+        }
+    }
+
+    /// Chamfered outline (corner pixels skipped).
+    pub fn chamfer_outline(&mut self, x: i32, y: i32, w: i32, h: i32, c: C) {
+        self.hline(x + 1, y, w - 2, c);
+        self.hline(x + 1, y + h - 1, w - 2, c);
+        self.vline(x, y + 1, h - 2, c);
+        self.vline(x + w - 1, y + 1, h - 2, c);
+    }
+
+    /// Scaled-up mini font text (each pixel becomes `k` x `k`).
+    pub fn text3_scaled(&mut self, x: i32, y: i32, s: &str, c: C, k: i32) {
+        let mut cx = x;
+        for ch in s.chars() {
+            let g = mini_glyph(ch);
+            for (row, line) in g.iter().enumerate() {
+                for (col, b) in line.bytes().enumerate() {
+                    if b == b'#' {
+                        self.fill(cx + col as i32 * k, y + row as i32 * k, k, k, c);
+                    }
+                }
+            }
+            cx += 4 * k;
+        }
+    }
+
     /// A beveled rectangle: light top/left and dark bottom/right when raised.
     fn bevel(&mut self, x: i32, y: i32, w: i32, h: i32, raised: bool, face: C) {
+        if self.t.flat {
+            // HUD style: translucent dark panel with a thin chamfered outline;
+            // pressed = accent outline and a brighter fill.
+            self.fill_bg(x, y, w, h, false);
+            self.darken(x, y, w, h, if raised { 0.42 } else { 0.7 });
+            let line = if raised { self.t.light } else { self.t.accent };
+            self.chamfer_outline(x, y, w, h, line);
+            if !raised {
+                let acc = self.t.accent;
+                self.hline(x + 1, y + 1, w - 2, acc);
+            }
+            return;
+        }
         self.fill(x, y, w, h, face);
-        let (tl, br) = if raised { (self.t.lighter, self.t.dark) } else { (self.t.dark, self.t.lighter) };
+        let (tl, br) = if raised {
+            (self.t.lighter, self.t.dark)
+        } else {
+            (self.t.dark, self.t.lighter)
+        };
         self.hline(x, y, w, tl);
         self.vline(x, y, h, tl);
         self.hline(x, y + h - 1, w, br);
         self.vline(x + w - 1, y, h, br);
     }
 
-    /// Sunken "self.t.lcd" panel.
+    /// Sunken LCD panel (or, for flat themes, a translucent scanner display).
     fn panel(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        if self.t.flat {
+            self.fill_bg(x, y, w, h, false);
+            self.darken(x, y, w, h, 0.18);
+            let acc = self.t.accent;
+            let l = 4.min(w / 3).min(h / 2);
+            for (bx, by, dx, dy) in [
+                (x - 1, y - 1, 1, 1),
+                (x + w, y - 1, -1, 1),
+                (x - 1, y + h, 1, -1),
+                (x + w, y + h, -1, -1),
+            ] {
+                for i in 0..l {
+                    self.px(bx + dx * i, by, acc);
+                    self.px(bx, by + dy * i, acc);
+                }
+            }
+            return;
+        }
         self.fill(x, y, w, h, self.t.lcd);
         self.hline(x - 1, y - 1, w + 2, self.t.dark);
         self.vline(x - 1, y - 1, h + 2, self.t.dark);
@@ -217,7 +319,7 @@ impl Canvas {
         }
     }
 
-    fn text3(&mut self, x: i32, y: i32, s: &str, c: C) {
+    pub fn text3(&mut self, x: i32, y: i32, s: &str, c: C) {
         // On patterned themes give labels a dark backing so they stay legible.
         if self.t.pattern.is_some() {
             let w = Canvas::text3_width(s);
@@ -252,7 +354,11 @@ impl Canvas {
 
     /// Decorative title stripes (pairs of light/dark lines).
     fn stripes(&mut self, x: i32, y: i32, w: i32, bright: bool) {
-        let (a, b) = if bright { (self.t.lighter, self.t.dark) } else { (self.t.light, self.t.bg2) };
+        let (a, b) = if bright {
+            (self.t.lighter, self.t.dark)
+        } else {
+            (self.t.light, self.t.bg2)
+        };
         for i in 0..3 {
             self.hline(x, y + 1 + i * 3, w, a);
             self.hline(x, y + 2 + i * 3, w, b);
@@ -279,12 +385,20 @@ fn lerp(a: C, b: C, t: f32) -> C {
 }
 
 fn title_bar(t: &Theme, c: &mut Canvas, x: i32, y: i32, text: &str, active: bool, shade: bool) {
-    let tw = Canvas::text3_width(text) + 10;
+    let emblem_w = if t.emblem.is_some() { 12 } else { 0 };
+    let tw = Canvas::text3_width(text) + 10 + emblem_w;
+    c.origin = (-x, -y);
     c.fill_bg(x, y, 275, 14, !active);
+    c.origin = (0, 0);
     let tx = x + (275 - tw) / 2;
     c.stripes(x + 10, y + 2, tx - x - 14, active);
     c.stripes(tx + tw + 4, y + 2, 275 - (tx - x) - tw - 4 - 38, active);
-    c.text3(tx + 5, y + 4, text, if active { t.label } else { t.label_dim });
+    if let Some(e) = t.emblem {
+        c.fill(tx + 3, y + 1, 11, 11, t.bg);
+        e(c, tx + 4, y + 2);
+    }
+    let color = if active { t.title_color } else { t.label_dim };
+    c.text3(tx + 5 + emblem_w, y + 4, text, color);
     // Baked unpressed buttons.
     draw_title_button(t, c, x + 6, y + 3, 'o');
     draw_title_button(t, c, x + 244, y + 3, '_');
@@ -346,8 +460,8 @@ fn main_bmp(t: &Theme) -> RgbaImage {
 
 fn titlebar_bmp(t: &Theme) -> RgbaImage {
     let mut c = Canvas::new(t, 344, 87, t.bg);
-    title_bar(t, &mut c, 27, 0, "WINAMP", true, false);
-    title_bar(t, &mut c, 27, 15, "WINAMP", false, false);
+    title_bar(t, &mut c, 27, 0, t.title_main, true, false);
+    title_bar(t, &mut c, 27, 15, t.title_main, false, false);
     // Shade mode bars: title text area is drawn by the app; leave a panel.
     for (y, active) in [(29, true), (42, false)] {
         c.fill_bg(27, y, 275, 14, !active);
@@ -385,7 +499,13 @@ fn titlebar_bmp(t: &Theme) -> RgbaImage {
         }
     }
     // Pressed clutter buttons.
-    let pressed = [(304, 47, 8, 'O'), (312, 55, 7, 'A'), (320, 62, 7, 'I'), (328, 69, 8, 'D'), (336, 77, 7, 'V')];
+    let pressed = [
+        (304, 47, 8, 'O'),
+        (312, 55, 7, 'A'),
+        (320, 62, 7, 'I'),
+        (328, 69, 8, 'D'),
+        (336, 77, 7, 'V'),
+    ];
     for (x, y, h, ch) in pressed {
         c.fill(x, y, 8, h, t.face_down);
         c.text3(x + 3, y + 1, &ch.to_string(), t.white);
@@ -432,7 +552,13 @@ fn transport_glyph(_t: &Theme, c: &mut Canvas, x: i32, y: i32, kind: &str, col: 
 
 fn cbuttons_bmp(t: &Theme) -> RgbaImage {
     let mut c = Canvas::new(t, 136, 36, t.bg);
-    let buttons = [("prev", 0, 23, 8), ("play", 23, 23, 10), ("pause", 46, 23, 8), ("stop", 69, 23, 8), ("next", 92, 22, 7)];
+    let buttons = [
+        ("prev", 0, 23, 8),
+        ("play", 23, 23, 10),
+        ("pause", 46, 23, 8),
+        ("stop", 69, 23, 8),
+        ("next", 92, 22, 7),
+    ];
     for (kind, x, w, gx) in buttons {
         for (down, y) in [(false, 0), (true, 18)] {
             c.bevel(x, y, w, 18, !down, if down { t.face_down } else { t.face });
@@ -441,14 +567,33 @@ fn cbuttons_bmp(t: &Theme) -> RgbaImage {
         }
     }
     for (down, y) in [(false, 0), (true, 16)] {
-        c.bevel(114, y, 22, 16, !down, if down { t.face_down } else { t.face });
+        c.bevel(
+            114,
+            y,
+            22,
+            16,
+            !down,
+            if down { t.face_down } else { t.face },
+        );
         let off = if down { 1 } else { 0 };
         transport_glyph(t, &mut c, 114 + 8 + off, y + 5 + off, "eject", t.label);
     }
     c.img
 }
 
-fn toggle_button(t: &Theme, c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, label: &str, on: bool, down: bool, mini: bool) {
+#[allow(clippy::too_many_arguments)]
+fn toggle_button(
+    t: &Theme,
+    c: &mut Canvas,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    label: &str,
+    on: bool,
+    down: bool,
+    mini: bool,
+) {
     c.bevel(x, y, w, h, !down, if down { t.face_down } else { t.face });
     let col = if on { t.green } else { t.label_dim };
     let off = if down { 1 } else { 0 };
@@ -467,7 +612,10 @@ fn toggle_button(t: &Theme, c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, labe
 
 fn shufrep_bmp(t: &Theme) -> RgbaImage {
     let mut c = Canvas::new(t, 92, 85, t.bg);
-    for (i, (on, down)) in [(false, false), (false, true), (true, false), (true, true)].iter().enumerate() {
+    for (i, (on, down)) in [(false, false), (false, true), (true, false), (true, true)]
+        .iter()
+        .enumerate()
+    {
         let y = i as i32 * 15;
         toggle_button(t, &mut c, 0, y, 28, 15, "REPEAT", *on, *down, true);
         toggle_button(t, &mut c, 28, y, 47, 15, "SHUFFLE", *on, *down, true);
@@ -514,7 +662,11 @@ fn volume_bmp(t: &Theme) -> RgbaImage {
         let w = (tt * 64.0) as i32;
         for x in 0..w {
             let tt = x as f32 / 64.0;
-            let col = if tt < 0.5 { lerp(t.grad_lo, t.grad_mid, tt * 2.0) } else { lerp(t.grad_mid, t.grad_hi, (tt - 0.5) * 2.0) };
+            let col = if tt < 0.5 {
+                lerp(t.grad_lo, t.grad_mid, tt * 2.0)
+            } else {
+                lerp(t.grad_mid, t.grad_hi, (tt - 0.5) * 2.0)
+            };
             c.vline(2 + x, y + 5, 3, col);
         }
     }
@@ -597,7 +749,10 @@ pub fn nums_ex_from_numbers(t: &Theme, numbers: &RgbaImage) -> RgbaImage {
     // Copy the blank cell as background for the minus cell.
     for y in 0..13 {
         for x in 0..9 {
-            let p = numbers.get_pixel((90 + x).min(numbers.width() - 1), y.min(numbers.height() - 1));
+            let p = numbers.get_pixel(
+                (90 + x).min(numbers.width() - 1),
+                y.min(numbers.height() - 1),
+            );
             c.px(99 + x as i32, y as i32, [p[0], p[1], p[2]]);
         }
     }
@@ -621,9 +776,18 @@ pub fn nums_ex_from_numbers(t: &Theme, numbers: &RgbaImage) -> RgbaImage {
 fn text_bmp(t: &Theme) -> RgbaImage {
     let mut c = Canvas::new(t, 155, 18, t.lcd);
     let rows: [&[char]; 3] = [
-        &['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '"', '@', ' ', ' ', ' '],
-        &['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '…', '.', ':', '(', ')', '-', '\'', '!', '_', '+', '\\', '/', '[', ']', '^', '&', '%', ',', '=', '$', '#'],
-        &['Å', 'Ö', 'Ä', '?', '*', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' '],
+        &[
+            'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q',
+            'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '"', '@', ' ', ' ', ' ',
+        ],
+        &[
+            '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '…', '.', ':', '(', ')', '-', '\'',
+            '!', '_', '+', '\\', '/', '[', ']', '^', '&', '%', ',', '=', '$', '#',
+        ],
+        &[
+            'Å', 'Ö', 'Ä', '?', '*', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
+            ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
+        ],
     ];
     for (r, row) in rows.iter().enumerate() {
         for (col, ch) in row.iter().enumerate() {
@@ -646,7 +810,9 @@ fn eqmain_bmp(t: &Theme) -> RgbaImage {
     c.text3(49, 38, "+12DB", t.label_dim);
     c.text3(55, 64, "0DB", t.label_dim);
     c.text3(49, 92, "-12DB", t.label_dim);
-    let labels = ["60", "170", "310", "600", "1K", "3K", "6K", "12K", "14K", "16K"];
+    let labels = [
+        "60", "170", "310", "600", "1K", "3K", "6K", "12K", "14K", "16K",
+    ];
     for (i, l) in labels.iter().enumerate() {
         let x = 78 + i as i32 * 18;
         let tw = Canvas::text3_width(l);
@@ -656,17 +822,27 @@ fn eqmain_bmp(t: &Theme) -> RgbaImage {
     draw_title_button_state(t, &mut c, 0, 116, 'x', false);
     draw_title_button_state(t, &mut c, 0, 125, 'x', true);
     // ON / AUTO buttons
-    let on_btn = [(10, false, false), (128, false, true), (69, true, false), (187, true, true)];
+    let on_btn = [
+        (10, false, false),
+        (128, false, true),
+        (69, true, false),
+        (187, true, true),
+    ];
     for (x, on, down) in on_btn {
         toggle_button(t, &mut c, x, 119, 26, 12, "ON", on, down, true);
     }
-    let auto_btn = [(35, false, false), (153, false, true), (94, true, false), (212, true, true)];
+    let auto_btn = [
+        (35, false, false),
+        (153, false, true),
+        (94, true, false),
+        (212, true, true),
+    ];
     for (x, on, down) in auto_btn {
         toggle_button(t, &mut c, x, 119, 32, 12, "AUTO", on, down, true);
     }
     // Title bars
-    title_bar(t, &mut c, 0, 134, "WINAMP EQUALIZER", true, false);
-    title_bar(t, &mut c, 0, 149, "WINAMP EQUALIZER", false, false);
+    title_bar(t, &mut c, 0, 134, t.title_eq, true, false);
+    title_bar(t, &mut c, 0, 149, t.title_eq, false, false);
     // Slider backgrounds: 28 frames, 14x63 at (13 + i*15, 164 + row*65)
     for f in 0..28 {
         let x = 13 + (f % 14) * 15;
@@ -678,8 +854,16 @@ fn eqmain_bmp(t: &Theme) -> RgbaImage {
         let tt = f as f32 / 27.0;
         let center = y + 31;
         let level = y + 5 + ((1.0 - tt) * 51.0) as i32 + 5;
-        let col = if tt < 0.5 { lerp(t.grad_hi, t.grad_mid, tt * 2.0) } else { lerp(t.grad_mid, t.grad_lo, (tt - 0.5) * 2.0) };
-        let (a, b) = if level < center { (level, center) } else { (center, level) };
+        let col = if tt < 0.5 {
+            lerp(t.grad_hi, t.grad_mid, tt * 2.0)
+        } else {
+            lerp(t.grad_mid, t.grad_lo, (tt - 0.5) * 2.0)
+        };
+        let (a, b) = if level < center {
+            (level, center)
+        } else {
+            (center, level)
+        };
         c.fill(x + 6, a, 2, (b - a).max(1), col);
         c.hline(x + 3, center, 8, t.label_dim);
     }
@@ -690,7 +874,14 @@ fn eqmain_bmp(t: &Theme) -> RgbaImage {
     }
     // Presets button
     for (y, down) in [(164, false), (176, true)] {
-        c.bevel(224, y, 44, 12, !down, if down { t.face_down } else { t.face });
+        c.bevel(
+            224,
+            y,
+            44,
+            12,
+            !down,
+            if down { t.face_down } else { t.face },
+        );
         let off = if down { 1 } else { 0 };
         c.text3(224 + 9 + off, y + 4 + off, "PRESETS", t.label);
     }
@@ -702,7 +893,11 @@ fn eqmain_bmp(t: &Theme) -> RgbaImage {
     }
     for y in 0..19 {
         let tt = y as f32 / 18.0;
-        let col = if tt < 0.5 { lerp(t.grad_lo, t.grad_mid, tt * 2.0) } else { lerp(t.grad_mid, t.grad_hi, (tt - 0.5) * 2.0) };
+        let col = if tt < 0.5 {
+            lerp(t.grad_lo, t.grad_mid, tt * 2.0)
+        } else {
+            lerp(t.grad_mid, t.grad_hi, (tt - 0.5) * 2.0)
+        };
         c.px(115, 294 + y, col);
     }
     c.img
@@ -713,7 +908,12 @@ fn eq_ex_bmp(t: &Theme) -> RgbaImage {
     for (y, active) in [(0, true), (15, false)] {
         c.fill_bg(0, y, 275, 14, !active);
         c.stripes(16, y + 2, 60, active);
-        c.text3(90, y + 4, "WINAMP EQUALIZER", if active { t.label } else { t.label_dim });
+        c.text3(
+            90,
+            y + 4,
+            t.title_eq,
+            if active { t.title_color } else { t.label_dim },
+        );
         c.stripes(165, y + 2, 75, active);
         draw_title_button(t, &mut c, 254, y + 3, 'u');
         draw_title_button(t, &mut c, 264, y + 3, 'x');
@@ -763,7 +963,14 @@ fn pledit_bmp(t: &Theme) -> RgbaImage {
         // Title 100x20
         c.fill_bg(26, y, 100, 20, !active);
         c.stripes(26, y + 5, 12, active);
-        c.text3(46, y + 7, "PLAYLIST EDITOR", fg);
+        let ptw = Canvas::text3_width(t.title_pl);
+        let px0 = 26 + (100 - ptw) / 2;
+        c.text3(
+            px0,
+            y + 7,
+            t.title_pl,
+            if active { t.title_color } else { fg },
+        );
         c.stripes(26 + 86, y + 5, 14, active);
         // Top tile 25x20
         c.fill_bg(127, y, 25, 20, !active);
@@ -790,7 +997,12 @@ fn pledit_bmp(t: &Theme) -> RgbaImage {
     for (x, down) in [(52, false), (61, true)] {
         c.bevel(x, 53, 8, 18, !down, if down { t.face_down } else { t.face });
         for i in 0..3 {
-            c.hline(x + 2, 53 + 6 + i * 3, 4, if down { t.dark } else { t.lighter });
+            c.hline(
+                x + 2,
+                53 + 6 + i * 3,
+                4,
+                if down { t.dark } else { t.lighter },
+            );
         }
     }
     // Shade mode backgrounds: left (72,42) 25x14, tile (72,57) 25x14,
@@ -857,6 +1069,17 @@ pub fn generate_theme(t: &Theme) -> Skin {
     images.insert(SkinImage::EqEx, eq_ex_bmp(t));
     images.insert(SkinImage::PlEdit, pledit_bmp(t));
     let _ = t.accent;
+    if let Some(deco) = t.decorate {
+        for (which, img) in images.iter_mut() {
+            let mut c = Canvas {
+                img: std::mem::take(img),
+                t: *t,
+                origin: (0, 0),
+            };
+            deco(&mut c, *which);
+            *img = c.img;
+        }
+    }
     Skin {
         name: t.name.to_string(),
         images,

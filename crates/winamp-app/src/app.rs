@@ -5,6 +5,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result};
 use egui::{Pos2, Vec2, ViewportBuilder, ViewportCommand, WindowLevel};
 use winamp_audio::{format_duration, EqSettings, Event, PlayState, Player, Source, TrackMeta};
 use winamp_playlist::{Playlist, SortKey};
@@ -68,21 +69,27 @@ pub struct App {
     pub main_hidden: bool,
     pub pl_scroll: usize,
     pub pl_anchor: Option<usize>,
+    pub milk: Option<crate::vis_window::MilkState>,
     tags_tx: Sender<Source>,
     tags_rx: Receiver<(Source, TrackMeta)>,
     consecutive_errors: usize,
     last_save: Instant,
     pub started: Instant,
     pub pending_exit: bool,
+    /// True while any of our windows is focused; all windows float together then.
+    pub app_focused: bool,
+    last_main_level: Option<WindowLevel>,
     initial_pos: [Option<Pos2>; 3],
 }
 
 pub const MARQUEE_STEP_MS: u64 = 220;
 
 impl App {
-    pub fn new(egui_ctx: &egui::Context, args: Vec<String>) -> Self {
+    /// Build the application: open the audio device, load the skin and
+    /// settings, then queue any files given on the command line.
+    pub fn new(egui_ctx: &egui::Context, args: Vec<String>) -> Result<Self> {
         let cfg = Config::load();
-        let player = Player::new().expect("audio output");
+        let player = Player::new().context("opening the audio output")?;
         player.set_volume(cfg.volume);
         player.set_balance(cfg.balance);
         player.set_eq(cfg.eq.to_settings());
@@ -115,7 +122,7 @@ impl App {
                     }
                 }
             })
-            .expect("spawn tag thread");
+            .context("spawning the tag reader thread")?;
 
         let mut windows = Windows::new();
         windows.get_mut(Win::Main).visible = true;
@@ -151,12 +158,15 @@ impl App {
             main_hidden: false,
             pl_scroll: 0,
             pl_anchor: None,
+            milk: None,
             tags_tx,
             tags_rx,
             consecutive_errors: 0,
             last_save: Instant::now(),
             started: Instant::now(),
             pending_exit: false,
+            app_focused: false,
+            last_main_level: None,
             initial_pos: [None; 3],
             cfg,
         };
@@ -166,10 +176,13 @@ impl App {
             app.cfg.pl_pos.map(|p| Pos2::new(p.x, p.y)),
         ];
         app.load_saved_playlist();
+        if app.cfg.milkdrop_visible {
+            app.milk = Some(crate::vis_window::MilkState::new());
+        }
         let mut play_first_new = false;
         let before = app.playlist.len();
         for a in &args {
-            let src = Source::from_str(a);
+            let src = Source::parse(a);
             match src {
                 Source::Url(u) => app.add_url(&u),
                 Source::File(p) => {
@@ -181,7 +194,7 @@ impl App {
         if play_first_new && app.playlist.len() > before {
             app.play_index(before);
         }
-        app
+        Ok(app)
     }
 
     // --- persistence --------------------------------------------------------
@@ -198,20 +211,28 @@ impl App {
     }
 
     pub fn save_all(&mut self) {
-        let p = crate::config::playlist_path();
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        let playlist_path = crate::config::playlist_path();
+        if let Some(dir) = playlist_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                log::warn!("creating config folder: {e}");
+            }
         }
-        let keep = self.playlist.path.take();
-        let _ = self.playlist.save_file(&p);
-        self.playlist.path = keep;
+        // The saved playlist is a session snapshot, not the user's "current file".
+        let user_path = self.playlist.path.take();
+        if let Err(e) = self.playlist.save_file(&playlist_path) {
+            log::warn!("saving session playlist: {e}");
+        }
+        self.playlist.path = user_path;
         self.cfg.volume = self.player.volume();
         self.cfg.balance = self.player.balance();
-        self.cfg.eq.from_settings(&self.player.eq());
+        self.cfg.eq.update_from(&self.player.eq());
         self.cfg.eq.auto = self.eq_auto;
         for w in Win::ALL {
             let info = self.windows.get(w);
-            let pos = info.rect.map(|r| WindowPos { x: r.min.x, y: r.min.y });
+            let pos = info.rect.map(|r| WindowPos {
+                x: r.min.x,
+                y: r.min.y,
+            });
             match w {
                 Win::Main => {
                     self.cfg.main_pos = pos.or(self.cfg.main_pos);
@@ -229,8 +250,26 @@ impl App {
                 }
             }
         }
-        self.cfg.save();
+        self.persist_config();
         self.last_save = Instant::now();
+    }
+
+    /// Write the settings file, logging (not propagating) failures: a
+    /// read-only config folder must not break playback.
+    pub fn persist_config(&self) {
+        if let Err(e) = self.cfg.save() {
+            log::warn!("saving config: {e}");
+        }
+    }
+
+    /// Replace the EQ gains while leaving the on/off switch as it is, which
+    /// is how Winamp applies presets.
+    fn set_eq_keeping_enabled(&self, settings: EqSettings) {
+        let enabled = self.player.eq().enabled;
+        self.player.set_eq(EqSettings {
+            enabled,
+            ..settings
+        });
     }
 
     // --- helpers ------------------------------------------------------------
@@ -248,8 +287,8 @@ impl App {
     }
 
     pub fn queue_tags(&self, src: &Source) {
-        if self.cfg.read_tags_on_add {
-            let _ = self.tags_tx.send(src.clone());
+        if self.cfg.read_tags_on_add && self.tags_tx.send(src.clone()).is_err() {
+            log::debug!("tag reader thread is gone");
         }
     }
 
@@ -299,13 +338,13 @@ impl App {
             return;
         }
         self.playlist.set_current(i);
-        let src = self.playlist.entries[i].source.clone();
-        if src.is_url() {
+        let source = self.playlist.entries[i].source.clone();
+        if source.is_url() {
             self.set_status("Connecting...");
         }
-        self.player.load(src.clone(), true);
+        self.apply_auto_eq(&source);
+        self.player.load(source, true);
         self.marquee_offset = 0;
-        self.apply_auto_eq(&src);
         self.ensure_current_visible();
     }
 
@@ -314,10 +353,8 @@ impl App {
             return;
         }
         if let Source::File(p) = src {
-            if let Some(preset) = self.cfg.auto_preset_for(p) {
-                let mut s = preset.to_settings();
-                s.enabled = self.player.eq().enabled;
-                self.player.set_eq(s);
+            if let Some(settings) = self.cfg.auto_preset_for(p).map(Preset::to_settings) {
+                self.set_eq_keeping_enabled(settings);
             }
         }
     }
@@ -351,7 +388,10 @@ impl App {
     }
 
     pub fn pl_size(&self) -> Vec2 {
-        Vec2::new(275.0 + 25.0 * self.cfg.pl_extra_cols as f32, 116.0 + 29.0 * self.cfg.pl_extra_rows as f32)
+        Vec2::new(
+            275.0 + 25.0 * self.cfg.pl_extra_cols as f32,
+            116.0 + 29.0 * self.cfg.pl_extra_rows as f32,
+        )
     }
 
     pub fn pl_row_h(&self) -> f32 {
@@ -376,7 +416,13 @@ impl App {
                 let title = self
                     .player
                     .info()
-                    .and_then(|inf| if e.source.is_url() { inf.title.clone() } else { None })
+                    .and_then(|inf| {
+                        if e.source.is_url() {
+                            inf.title.clone()
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or_else(|| e.title.clone());
                 let dur = self.player.duration().or(e.duration);
                 match dur {
@@ -390,7 +436,9 @@ impl App {
 
     pub fn window_title(&self) -> String {
         match self.playlist.current {
-            Some(i) if i < self.playlist.len() => format!("{} - Winamp", self.playlist.entries[i].title),
+            Some(i) if i < self.playlist.len() => {
+                format!("{} - Winamp", self.playlist.entries[i].title)
+            }
             _ => "Winamp".to_string(),
         }
     }
@@ -457,7 +505,13 @@ impl App {
             }
         }
         // Dropped files on any window.
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
         if !dropped.is_empty() {
             let before = self.playlist.len();
             for p in &dropped {
@@ -478,12 +532,20 @@ impl App {
             AnalyzerStyle::Bars => 19,
             AnalyzerStyle::Lines => 75,
         };
-        let samples = if playing { self.player.vis_samples(winamp_audio::vis::VIS_SAMPLES) } else { vec![0.0; 576] };
+        let samples = if playing {
+            self.player.vis_samples(winamp_audio::vis::VIS_SAMPLES)
+        } else {
+            vec![0.0; 576]
+        };
         let spec = winamp_audio::vis::spectrum(&samples, self.player.output_sample_rate(), n);
-        for i in 0..n {
-            let target = spec[i] * 16.0;
+        for (i, &level) in spec.iter().enumerate().take(n) {
+            let target = level * 16.0;
             let cur = self.vis.bars[i];
-            self.vis.bars[i] = if target > cur { target } else { (cur - 0.9).max(0.0) };
+            self.vis.bars[i] = if target > cur {
+                target
+            } else {
+                (cur - 0.9).max(0.0)
+            };
             if self.vis.bars[i] >= self.vis.peaks[i] {
                 self.vis.peaks[i] = self.vis.bars[i];
                 self.vis.peak_hold[i] = 20;
@@ -527,7 +589,11 @@ impl App {
             Cmd::Play => {
                 if self.playlist.current.is_none() || self.player.current_source().is_none() {
                     if !self.playlist.is_empty() {
-                        let i = if self.cfg.shuffle { self.playlist.next_index(true, true).unwrap_or(0) } else { 0 };
+                        let i = if self.cfg.shuffle {
+                            self.playlist.next_index(true, true).unwrap_or(0)
+                        } else {
+                            0
+                        };
                         self.play_index(i);
                     } else {
                         self.exec(Cmd::OpenFiles, ctx);
@@ -559,10 +625,21 @@ impl App {
             }
             Cmd::OpenDirectory | Cmd::AddDirectory => {
                 let add_only = cmd == Cmd::AddDirectory;
-                if let Some(dir) = rfd::FileDialog::new().set_title("Open directory").pick_folder() {
+                if let Some(dir) = rfd::FileDialog::new()
+                    .set_title("Open directory")
+                    .pick_folder()
+                {
                     self.load_paths(vec![dir], add_only);
                 }
             }
+            Cmd::PlayUrl(url) => {
+                self.add_url(&url);
+                if !self.playlist.is_empty() {
+                    let last = self.playlist.len() - 1;
+                    self.play_index(last);
+                }
+            }
+            Cmd::QueueUrl(url) => self.add_url(&url),
             Cmd::OpenUrl => self.dialogs.open_url(false),
             Cmd::AddUrl => self.dialogs.open_url(true),
 
@@ -579,26 +656,65 @@ impl App {
                 w.visible = !w.visible;
             }
             Cmd::ToggleMainShade => {
+                let group = self.windows.docked_group(Win::Main);
                 let w = self.windows.get_mut(Win::Main);
                 w.shaded = !w.shaded;
-                let h = if w.shaded { sprites::SHADE_H } else { sprites::MAIN_H } as f32;
+                let h = if w.shaded {
+                    sprites::SHADE_H
+                } else {
+                    sprites::MAIN_H
+                } as f32;
                 let s = self.scale();
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(275.0 * s, h * s)));
+                self.restack(ctx, group);
             }
             Cmd::ToggleEqShade => {
+                let group = self.windows.docked_group(Win::Main);
                 let w = self.windows.get_mut(Win::Eq);
                 w.shaded = !w.shaded;
+                self.restack(ctx, group);
             }
             Cmd::TogglePlShade => {
                 let w = self.windows.get_mut(Win::Pl);
                 w.shaded = !w.shaded;
             }
             Cmd::ToggleDoubleSize => {
+                let group = self.windows.docked_group(Win::Main);
                 self.cfg.double_size = !self.cfg.double_size;
                 let s = self.scale();
-                let h = if self.windows.get(Win::Main).shaded { sprites::SHADE_H } else { sprites::MAIN_H } as f32;
+                let h = if self.windows.get(Win::Main).shaded {
+                    sprites::SHADE_H
+                } else {
+                    sprites::MAIN_H
+                } as f32;
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(275.0 * s, h * s)));
+                // Child windows are resized through their builders; move them so the stack stays attached.
+                for w in [Win::Eq, Win::Pl] {
+                    if let Some(r) = self.windows.get(w).rect {
+                        let size = match w {
+                            Win::Eq => Vec2::new(
+                                275.0,
+                                if self.windows.get(w).shaded {
+                                    14.0
+                                } else {
+                                    116.0
+                                },
+                            ),
+                            _ => Vec2::new(
+                                self.pl_size().x,
+                                if self.windows.get(w).shaded {
+                                    14.0
+                                } else {
+                                    self.pl_size().y
+                                },
+                            ),
+                        } * s;
+                        self.windows.get_mut(w).rect = Some(egui::Rect::from_min_size(r.min, size));
+                    }
+                }
+                self.restack(ctx, group);
             }
+            Cmd::ToggleLockWindows => self.cfg.lock_windows = !self.cfg.lock_windows,
             Cmd::ToggleAlwaysOnTop => {
                 self.cfg.always_on_top = !self.cfg.always_on_top;
                 ctx.send_viewport_cmd(ViewportCommand::WindowLevel(self.window_level()));
@@ -634,6 +750,39 @@ impl App {
             }
             Cmd::ToggleAnalyzerPeaks => self.cfg.analyzer_peaks = !self.cfg.analyzer_peaks,
             Cmd::ToggleScrollTitle => self.cfg.scroll_title = !self.cfg.scroll_title,
+            Cmd::ToggleMilkdrop => {
+                if self.milk.is_some() {
+                    self.milk = None;
+                    self.cfg.milkdrop_visible = false;
+                } else {
+                    let mut m = crate::vis_window::MilkState::new();
+                    m.announce();
+                    self.milk = Some(m);
+                    self.cfg.milkdrop_visible = true;
+                }
+            }
+            Cmd::MilkdropPreset(d) => {
+                if let Some(m) = &mut self.milk {
+                    match d {
+                        1 => m.engine.next_preset(),
+                        -1 => m.engine.prev_preset(),
+                        _ => m.engine.random_preset(),
+                    }
+                    m.announce();
+                }
+            }
+            Cmd::MilkdropSetPreset(i) => {
+                if let Some(m) = &mut self.milk {
+                    m.engine.set_preset(i);
+                    m.announce();
+                }
+            }
+            Cmd::MilkdropFullscreen => {
+                if let Some(m) = &mut self.milk {
+                    m.fullscreen = !m.fullscreen;
+                    crate::vis_window::send_fullscreen(ctx, m.fullscreen);
+                }
+            }
 
             Cmd::ToggleEqEnabled => {
                 let mut s = self.player.eq();
@@ -650,71 +799,76 @@ impl App {
             }
             Cmd::EqPresetsDialog => self.dialogs.eq_presets_open = true,
             Cmd::LoadPreset(name) => {
-                if let Some(p) = self.cfg.find_preset(&name).cloned() {
-                    let mut s = p.to_settings();
-                    s.enabled = self.player.eq().enabled;
-                    self.player.set_eq(s);
+                if let Some(settings) = self.cfg.find_preset(&name).map(Preset::to_settings) {
+                    self.set_eq_keeping_enabled(settings);
                 }
             }
             Cmd::LoadBuiltinPreset(i) => {
-                let presets = winamp_audio::eq::builtin_presets();
-                if let Some((_, s)) = presets.get(i) {
-                    let mut s = *s;
-                    s.enabled = self.player.eq().enabled;
-                    self.player.set_eq(s);
+                if let Some(preset) = winamp_audio::eq::builtin_presets().get(i) {
+                    self.set_eq_keeping_enabled(preset.settings);
                 }
             }
             Cmd::SavePreset(name) => {
-                let s = self.player.eq();
-                let p = Preset { name: name.clone(), preamp: s.preamp_db, bands: s.bands_db };
-                if let Some(existing) = self.cfg.presets.iter_mut().find(|p| p.name.eq_ignore_ascii_case(&name)) {
-                    *existing = p;
-                } else {
-                    self.cfg.presets.push(p);
+                let preset = Preset::from_settings(name, &self.player.eq());
+                match self
+                    .cfg
+                    .presets
+                    .iter_mut()
+                    .find(|existing| existing.has_name(&preset.name))
+                {
+                    Some(existing) => *existing = preset,
+                    None => self.cfg.presets.push(preset),
                 }
                 self.cfg.presets.sort_by_key(|p| p.name.to_lowercase());
-                self.cfg.save();
+                self.persist_config();
             }
             Cmd::DeletePreset(name) => {
-                self.cfg.presets.retain(|p| !p.name.eq_ignore_ascii_case(&name));
-                self.cfg.save();
+                self.cfg.presets.retain(|preset| !preset.has_name(&name));
+                self.persist_config();
             }
             Cmd::SaveAutoPreset => {
-                if let Some(Source::File(p)) = self.player.current_source().cloned() {
-                    let key = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                    let s = self.player.eq();
-                    let preset = Preset { name: key.clone(), preamp: s.preamp_db, bands: s.bands_db };
-                    self.cfg.auto_presets.retain(|p| !p.name.eq_ignore_ascii_case(&key));
+                if let Some(key) = self.current_file_name() {
+                    let preset = Preset::from_settings(key.clone(), &self.player.eq());
+                    self.cfg
+                        .auto_presets
+                        .retain(|existing| !existing.has_name(&key));
                     self.cfg.auto_presets.push(preset);
-                    self.cfg.save();
+                    self.persist_config();
                     self.set_status(format!("Saved auto-preset for {key}"));
                 }
             }
             Cmd::DeleteAutoPreset => {
-                if let Some(Source::File(p)) = self.player.current_source().cloned() {
-                    let key = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                    self.cfg.auto_presets.retain(|p| !p.name.eq_ignore_ascii_case(&key));
-                    self.cfg.save();
+                if let Some(key) = self.current_file_name() {
+                    self.cfg
+                        .auto_presets
+                        .retain(|existing| !existing.has_name(&key));
+                    self.persist_config();
                 }
             }
             Cmd::LoadPresetFile => {
-                if let Some(f) = rfd::FileDialog::new().add_filter("EQ presets", &["eqf", "q1"]).pick_file() {
+                if let Some(f) = rfd::FileDialog::new()
+                    .add_filter("EQ presets", &["eqf", "q1"])
+                    .pick_file()
+                {
                     match std::fs::read(&f) {
                         Ok(bytes) => {
                             let presets = winamp_audio::eq::parse_eqf(&bytes);
                             if presets.is_empty() {
                                 self.dialogs.message = Some("Not a valid EQF file".into());
-                            } else if presets.len() == 1 {
-                                let mut s = presets[0].1;
-                                s.enabled = self.player.eq().enabled;
-                                self.player.set_eq(s);
+                            } else if let [single] = presets.as_slice() {
+                                self.set_eq_keeping_enabled(single.settings);
                             } else {
-                                for (name, s) in presets {
-                                    self.cfg.presets.retain(|p| !p.name.eq_ignore_ascii_case(&name));
-                                    self.cfg.presets.push(Preset { name, preamp: s.preamp_db, bands: s.bands_db });
+                                for imported in presets {
+                                    self.cfg
+                                        .presets
+                                        .retain(|existing| !existing.has_name(&imported.name));
+                                    self.cfg.presets.push(Preset::from_settings(
+                                        imported.name,
+                                        &imported.settings,
+                                    ));
                                 }
                                 self.cfg.presets.sort_by_key(|p| p.name.to_lowercase());
-                                self.cfg.save();
+                                self.persist_config();
                             }
                         }
                         Err(e) => self.dialogs.message = Some(format!("Could not read file: {e}")),
@@ -722,18 +876,21 @@ impl App {
                 }
             }
             Cmd::SavePresetFile => {
-                if let Some(f) = rfd::FileDialog::new().add_filter("EQ preset", &["eqf"]).set_file_name("preset.eqf").save_file() {
+                if let Some(f) = rfd::FileDialog::new()
+                    .add_filter("EQ preset", &["eqf"])
+                    .set_file_name("preset.eqf")
+                    .save_file()
+                {
                     let s = self.player.eq();
-                    let bytes = winamp_audio::eq::write_eqf(&[("Entry1".to_string(), s)]);
+                    let bytes = winamp_audio::eq::write_eqf(&[winamp_audio::eq::EqPreset::new(
+                        "Entry1", s,
+                    )]);
                     if let Err(e) = std::fs::write(&f, bytes) {
                         self.dialogs.message = Some(format!("Could not save: {e}"));
                     }
                 }
             }
-            Cmd::EqFlat => {
-                let enabled = self.player.eq().enabled;
-                self.player.set_eq(EqSettings { enabled, ..EqSettings::flat() });
-            }
+            Cmd::EqFlat => self.set_eq_keeping_enabled(EqSettings::flat()),
             Cmd::SetPreamp(v) => {
                 let mut s = self.player.eq();
                 s.preamp_db = v;
@@ -783,13 +940,18 @@ impl App {
                 }
             }
             Cmd::PlLoad => {
-                if let Some(f) = rfd::FileDialog::new().add_filter("Playlists", &["m3u8", "m3u", "pls"]).pick_file() {
+                if let Some(f) = rfd::FileDialog::new()
+                    .add_filter("Playlists", &["m3u8", "m3u", "pls"])
+                    .pick_file()
+                {
                     match self.playlist.load_file(&f) {
                         Ok(()) => {
                             self.pl_scroll = 0;
                             self.queue_tags_for_all();
                         }
-                        Err(e) => self.dialogs.message = Some(format!("Could not load playlist: {e}")),
+                        Err(e) => {
+                            self.dialogs.message = Some(format!("Could not load playlist: {e}"))
+                        }
                     }
                 }
             }
@@ -799,7 +961,12 @@ impl App {
                 }
             }
             Cmd::PlFileInfo => {
-                let idx = self.playlist.selected_indices().first().copied().or(self.playlist.current);
+                let idx = self
+                    .playlist
+                    .selected_indices()
+                    .first()
+                    .copied()
+                    .or(self.playlist.current);
                 if let Some(i) = idx {
                     self.dialogs.file_info = Some(i);
                 }
@@ -853,14 +1020,57 @@ impl App {
         self.textures = Rc::new(Textures::from_skin(ctx, &skin));
         self.skin = Rc::new(skin);
         self.cfg.skin = path;
-        self.cfg.save();
+        self.persist_config();
+    }
+
+    fn restack(&mut self, ctx: &egui::Context, group: [bool; 3]) {
+        let s = self.scale();
+        let main_h = if self.windows.get(Win::Main).shaded {
+            14.0
+        } else {
+            116.0
+        };
+        let eq_h = if self.windows.get(Win::Eq).shaded {
+            14.0
+        } else {
+            116.0
+        };
+        self.windows.restack(ctx, group, main_h, eq_h, s);
+    }
+
+    /// Window level shared by all skinned windows. Besides the user's
+    /// "always on top" option, the windows float as a group while any of them
+    /// is focused, so docked companions aren't left behind other apps' windows
+    /// (macOS only raises the window that was clicked).
+    /// File name of the playing local file (the key for auto presets).
+    fn current_file_name(&self) -> Option<String> {
+        match self.player.current_source()? {
+            Source::File(path) => path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+            Source::Url(_) => None,
+        }
     }
 
     pub fn window_level(&self) -> WindowLevel {
-        if self.cfg.always_on_top {
+        if self.cfg.always_on_top || self.app_focused {
             WindowLevel::AlwaysOnTop
         } else {
             WindowLevel::Normal
+        }
+    }
+
+    /// Recompute the group focus state and push the main window's level when it
+    /// changes (child viewports pick it up through their builders).
+    pub fn update_window_level(&mut self, ctx: &egui::Context) {
+        let any = self.windows.info.iter().any(|w| w.visible && w.focused);
+        // Keep floating for a few frames after focus is lost so a click on a
+        // companion window (which briefly unfocuses everything) doesn't flicker.
+        self.app_focused = any;
+        let level = self.window_level();
+        if self.last_main_level != Some(level) {
+            self.last_main_level = Some(level);
+            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(level));
         }
     }
 
@@ -881,9 +1091,8 @@ impl App {
             Win::Eq => 1,
             Win::Pl => 2,
         };
-        if self.initial_pos[idx].is_none() {
-            self.initial_pos[idx] = Some(self.windows.default_position(w));
-        }
+        let position =
+            *self.initial_pos[idx].get_or_insert_with(|| self.windows.default_position(w));
         let title = match w {
             Win::Eq => "Winamp Equalizer",
             Win::Pl => "Winamp Playlist Editor",
@@ -894,7 +1103,7 @@ impl App {
             .with_decorations(false)
             .with_resizable(false)
             .with_inner_size(size * s)
-            .with_position(self.initial_pos[idx].unwrap())
+            .with_position(position)
             .with_window_level(self.window_level())
             .with_taskbar(false)
     }

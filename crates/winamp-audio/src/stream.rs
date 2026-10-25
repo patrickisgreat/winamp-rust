@@ -2,8 +2,15 @@
 
 use std::io::{self, Read};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_TIMEOUT: Duration = Duration::from_secs(20);
+const USER_AGENT: &str = "WinampRust/0.1 (like Winamp/2.95)";
+/// ICY metadata block lengths are sent as a byte count divided by 16.
+const META_LENGTH_UNIT: usize = 16;
 
 /// Information learned from the HTTP response headers of a stream.
 #[derive(Clone, Debug, Default)]
@@ -12,39 +19,46 @@ pub struct StreamInfo {
     pub genre: Option<String>,
     pub bitrate_kbps: Option<u32>,
     pub content_type: Option<String>,
+    /// Bytes of audio between ICY metadata blocks, when the server sends them.
     pub metaint: Option<usize>,
 }
 
-/// Shared slot that receives "StreamTitle" updates from the ICY metadata.
+/// Mailbox that receives "StreamTitle" updates from the ICY metadata. The
+/// reader writes a title in, the engine takes it out.
 pub type TitleSlot = Arc<Mutex<Option<String>>>;
 
 /// A reader that strips ICY metadata blocks out of a Shoutcast stream.
 pub struct IcyReader<R: Read> {
     inner: R,
     metaint: usize,
+    /// Audio bytes left before the next metadata block.
     until_meta: usize,
     title: TitleSlot,
 }
 
 impl<R: Read> IcyReader<R> {
     pub fn new(inner: R, metaint: usize, title: TitleSlot) -> Self {
-        Self { inner, metaint, until_meta: metaint, title }
+        Self {
+            inner,
+            metaint,
+            until_meta: metaint,
+            title,
+        }
     }
 
-    /// Returns Ok(false) at end of stream.
+    /// Consume one metadata block. Returns Ok(false) at end of stream.
     fn read_meta_block(&mut self) -> io::Result<bool> {
-        let mut len = [0u8; 1];
-        if self.inner.read(&mut len)? == 0 {
+        let mut length_byte = [0u8; 1];
+        if self.inner.read(&mut length_byte)? == 0 {
             return Ok(false);
         }
-        let n = len[0] as usize * 16;
-        if n == 0 {
+        let length = usize::from(length_byte[0]) * META_LENGTH_UNIT;
+        if length == 0 {
             return Ok(true);
         }
-        let mut buf = vec![0u8; n];
-        self.inner.read_exact(&mut buf)?;
-        let text = String::from_utf8_lossy(&buf);
-        if let Some(title) = parse_stream_title(&text) {
+        let mut block = vec![0u8; length];
+        self.inner.read_exact(&mut block)?;
+        if let Some(title) = parse_stream_title(&String::from_utf8_lossy(&block)) {
             if let Ok(mut slot) = self.title.lock() {
                 *slot = Some(title);
             }
@@ -65,59 +79,74 @@ impl<R: Read> Read for IcyReader<R> {
             self.until_meta = self.metaint;
         }
         let want = buf.len().min(self.until_meta);
-        let n = self.inner.read(&mut buf[..want])?;
-        self.until_meta -= n;
-        Ok(n)
+        let got = self.inner.read(&mut buf[..want])?;
+        self.until_meta -= got;
+        Ok(got)
     }
 }
 
+/// Extract the `StreamTitle='...';` value from an ICY metadata block.
 pub fn parse_stream_title(meta: &str) -> Option<String> {
-    let start = meta.find("StreamTitle='")? + "StreamTitle='".len();
+    const KEY: &str = "StreamTitle='";
+    let start = meta.find(KEY)? + KEY.len();
     let rest = &meta[start..];
     let end = rest.find("';").unwrap_or(rest.len());
-    let t = rest[..end].trim();
-    if t.is_empty() {
-        None
-    } else {
-        Some(t.to_string())
-    }
+    let title = rest[..end].trim();
+    (!title.is_empty()).then(|| title.to_string())
 }
 
-/// Open an HTTP(S) audio stream. Returns the reader (with ICY metadata stripped),
-/// header-derived info and the shared title slot.
-pub fn open(url: &str) -> Result<(Box<dyn Read + Send + Sync>, StreamInfo, TitleSlot)> {
+/// An opened HTTP(S) audio stream.
+pub struct OpenedStream {
+    /// Audio bytes with any ICY metadata already stripped out.
+    pub reader: Box<dyn Read + Send + Sync>,
+    pub info: StreamInfo,
+    pub title: TitleSlot,
+}
+
+/// Open an HTTP(S) audio stream, asking the server for ICY metadata.
+pub fn open(url: &str) -> Result<OpenedStream> {
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(10))
-        .timeout_read(std::time::Duration::from_secs(20))
-        .user_agent("WinampRust/0.1 (like Winamp/2.95)")
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout_read(READ_TIMEOUT)
+        .user_agent(USER_AGENT)
         .build();
-    let resp = agent
+    let response = agent
         .get(url)
         .set("Icy-MetaData", "1")
         .call()
         .with_context(|| format!("opening {url}"))?;
-    if resp.status() >= 400 {
-        return Err(anyhow!("HTTP {} for {url}", resp.status()));
+    if response.status() >= 400 {
+        return Err(anyhow!("HTTP {} for {url}", response.status()));
     }
-    let mut info = StreamInfo::default();
-    info.name = resp.header("icy-name").map(|s| s.to_string());
-    info.genre = resp.header("icy-genre").map(|s| s.to_string());
-    info.bitrate_kbps = resp.header("icy-br").and_then(|s| s.trim().parse().ok());
-    info.content_type = resp.header("content-type").map(|s| s.to_lowercase());
-    info.metaint = resp.header("icy-metaint").and_then(|s| s.trim().parse().ok());
-    let title: TitleSlot = Arc::new(Mutex::new(None));
-    let reader = resp.into_reader();
-    let reader: Box<dyn Read + Send + Sync> = match info.metaint {
-        Some(m) if m > 0 => Box::new(IcyReader::new(reader, m, title.clone())),
-        _ => Box::new(reader),
+    let header = |name: &str| response.header(name).map(str::to_string);
+    let info = StreamInfo {
+        name: header("icy-name"),
+        genre: header("icy-genre"),
+        bitrate_kbps: response
+            .header("icy-br")
+            .and_then(|s| s.trim().parse().ok()),
+        content_type: response.header("content-type").map(str::to_lowercase),
+        metaint: response
+            .header("icy-metaint")
+            .and_then(|s| s.trim().parse().ok()),
     };
-    Ok((reader, info, title))
+    let title: TitleSlot = Arc::new(Mutex::new(None));
+    let body = response.into_reader();
+    let reader: Box<dyn Read + Send + Sync> = match info.metaint {
+        Some(metaint) if metaint > 0 => Box::new(IcyReader::new(body, metaint, Arc::clone(&title))),
+        _ => Box::new(body),
+    };
+    Ok(OpenedStream {
+        reader,
+        info,
+        title,
+    })
 }
 
 /// Guess a container/codec extension hint from a MIME type.
 pub fn extension_for_mime(mime: &str) -> Option<&'static str> {
-    let m = mime.split(';').next().unwrap_or("").trim();
-    Some(match m {
+    let media_type = mime.split(';').next().unwrap_or("").trim();
+    Some(match media_type {
         "audio/mpeg" | "audio/mp3" | "audio/mpeg3" | "audio/x-mpeg" => "mp3",
         "audio/aac" | "audio/aacp" | "audio/x-aac" => "aac",
         "audio/ogg" | "application/ogg" | "audio/vorbis" => "ogg",
@@ -130,32 +159,98 @@ pub fn extension_for_mime(mime: &str) -> Option<&'static str> {
 
 /// Fetch a small text resource (used for remote .pls / .m3u playlists).
 pub fn fetch_text(url: &str, max_bytes: usize) -> Result<String> {
-    let resp = ureq::get(url).call().with_context(|| format!("fetching {url}"))?;
-    let mut reader = resp.into_reader().take(max_bytes as u64);
-    let mut s = String::new();
-    reader.read_to_string(&mut s)?;
-    Ok(s)
+    let response = ureq::get(url)
+        .call()
+        .with_context(|| format!("fetching {url}"))?;
+    let mut text = String::new();
+    response
+        .into_reader()
+        .take(max_bytes as u64)
+        .read_to_string(&mut text)?;
+    Ok(text)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn meta_block(text: &str) -> Vec<u8> {
+        let mut block = text.as_bytes().to_vec();
+        let padded = block.len().div_ceil(META_LENGTH_UNIT) * META_LENGTH_UNIT;
+        block.resize(padded, 0);
+        let mut out = vec![(padded / META_LENGTH_UNIT) as u8];
+        out.extend(block);
+        out
+    }
+
     #[test]
-    fn strips_metadata() {
-        // metaint = 4, one metadata block of 16 bytes
-        let mut data = Vec::new();
-        data.extend_from_slice(b"abcd");
-        data.push(1);
-        let mut meta = b"StreamTitle='x';".to_vec();
-        meta.resize(16, 0);
-        data.extend_from_slice(&meta);
+    fn strips_metadata_and_publishes_title() {
+        let mut data = b"abcd".to_vec();
+        data.extend(meta_block("StreamTitle='x';"));
         data.extend_from_slice(b"efgh");
         let slot = TitleSlot::default();
-        let mut r = IcyReader::new(&data[..], 4, slot.clone());
+        let mut reader = IcyReader::new(&data[..], 4, Arc::clone(&slot));
         let mut out = Vec::new();
-        r.read_to_end(&mut out).unwrap();
+        reader.read_to_end(&mut out).unwrap();
         assert_eq!(out, b"abcdefgh");
         assert_eq!(slot.lock().unwrap().as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn handles_empty_blocks_and_partial_reads() {
+        let mut data = b"1234".to_vec();
+        data.push(0); // empty metadata block
+        data.extend_from_slice(b"5678");
+        data.extend(meta_block("StreamTitle='Song - Artist';StreamUrl='';"));
+        data.extend_from_slice(b"9");
+        let slot = TitleSlot::default();
+        let mut reader = IcyReader::new(&data[..], 4, Arc::clone(&slot));
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 3];
+        loop {
+            let got = reader.read(&mut chunk).unwrap();
+            if got == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..got]);
+        }
+        assert_eq!(out, b"123456789");
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("Song - Artist"));
+    }
+
+    #[test]
+    fn metaint_zero_passes_bytes_through() {
+        let data = b"raw audio bytes";
+        let mut reader = IcyReader::new(&data[..], 0, TitleSlot::default());
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn parses_stream_title_variants() {
+        assert_eq!(
+            parse_stream_title("StreamTitle='A - B';StreamUrl='';"),
+            Some("A - B".into())
+        );
+        assert_eq!(
+            parse_stream_title("StreamTitle='  spaced  ';"),
+            Some("spaced".into())
+        );
+        assert_eq!(
+            parse_stream_title("StreamTitle='unterminated"),
+            Some("unterminated".into())
+        );
+        assert_eq!(parse_stream_title("StreamTitle='';"), None);
+        assert_eq!(parse_stream_title("StreamUrl='x';"), None);
+    }
+
+    #[test]
+    fn maps_mime_types_to_extensions() {
+        assert_eq!(extension_for_mime("audio/mpeg"), Some("mp3"));
+        assert_eq!(extension_for_mime("audio/aacp; charset=utf-8"), Some("aac"));
+        assert_eq!(extension_for_mime("application/ogg"), Some("ogg"));
+        assert_eq!(extension_for_mime("text/html"), None);
+        assert_eq!(extension_for_mime(""), None);
     }
 }

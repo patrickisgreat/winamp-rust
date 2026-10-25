@@ -1,0 +1,26 @@
+[package]
+name = "winamp-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "winamp"
+
+[[bin]]
+name = "winamp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde.workspace = true
+toml.workspace = true
+eframe.workspace = true
+egui.workspace = true
+rfd.workspace = true
+directories.workspace = true
+rand.workspace = true
+image.workspace = true
+winamp-audio = { path = "../winamp-audio" }
+winamp-skin = { path = "../winamp-skin" }
+winamp-playlist = { path = "../winamp-playlist" }

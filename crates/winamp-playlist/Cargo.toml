@@ -1,0 +1,13 @@
+[package]
+name = "winamp-playlist"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+rand.workspace = true
+walkdir.workspace = true
+percent-encoding.workspace = true
+winamp-audio = { path = "../winamp-audio" }

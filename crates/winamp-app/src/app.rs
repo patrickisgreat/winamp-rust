@@ -1053,20 +1053,35 @@ impl App {
     }
 
     pub fn window_level(&self) -> WindowLevel {
-        if self.cfg.always_on_top || self.app_focused {
+        if self.cfg.always_on_top {
             WindowLevel::AlwaysOnTop
         } else {
             WindowLevel::Normal
         }
     }
 
-    /// Recompute the group focus state and push the main window's level when it
-    /// changes (child viewports pick it up through their builders).
+    /// Bring the whole window group forward when the application regains
+    /// focus. macOS only raises the window that was clicked, which left the
+    /// docked EQ/playlist behind other apps' windows; raising each companion
+    /// (and then re-focusing the clicked window) keeps the stack together
+    /// without playing with window levels, which made windows drop behind
+    /// everything whenever focus left.
     pub fn update_window_level(&mut self, ctx: &egui::Context) {
-        let any = self.windows.info.iter().any(|w| w.visible && w.focused);
-        // Keep floating for a few frames after focus is lost so a click on a
-        // companion window (which briefly unfocuses everything) doesn't flicker.
-        self.app_focused = any;
+        let focused: Option<Win> = Win::ALL.into_iter().find(|w| {
+            let i = self.windows.get(*w);
+            i.visible && i.focused
+        });
+        if let Some(active) = focused {
+            if !self.app_focused {
+                for w in Win::ALL {
+                    if w != active && self.windows.get(w).visible {
+                        ctx.send_viewport_cmd_to(w.viewport_id(), ViewportCommand::Focus);
+                    }
+                }
+                ctx.send_viewport_cmd_to(active.viewport_id(), ViewportCommand::Focus);
+            }
+        }
+        self.app_focused = focused.is_some();
         let level = self.window_level();
         if self.last_main_level != Some(level) {
             self.last_main_level = Some(level);

@@ -331,6 +331,7 @@ impl Milkdrop {
         let mid = band(n / 6, n / 2);
         let treb = band(n / 2, n);
         let vol = (wave.iter().map(|s| s * s).sum::<f32>() / wave.len().max(1) as f32).sqrt();
+        let vol = if vol.is_finite() { vol } else { 0.0 };
         let a = 0.08;
         self.bass_avg = self.bass_avg * (1.0 - a) + bass * a;
         self.mid_avg = self.mid_avg * (1.0 - a) + mid * a;
@@ -494,6 +495,9 @@ impl Milkdrop {
     fn plot(&mut self, x: f32, y: f32, c: [f32; 3], thick: bool) {
         let w = self.w as i32;
         let h = self.h as i32;
+        if !x.is_finite() || !y.is_finite() {
+            return;
+        }
         let xi = x.round() as i32;
         let yi = y.round() as i32;
         let pts: &[(i32, i32)] = if thick {
@@ -513,9 +517,13 @@ impl Milkdrop {
     }
 
     fn line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, c: [f32; 3], thick: bool) {
+        if ![x0, y0, x1, y1].iter().all(|v| v.is_finite()) {
+            return;
+        }
         let dx = x1 - x0;
         let dy = y1 - y0;
-        let steps = dx.abs().max(dy.abs()).ceil().max(1.0) as usize;
+        // Cap the step count so an absurd coordinate can never stall a frame.
+        let steps = dx.abs().max(dy.abs()).ceil().clamp(1.0, 4096.0) as usize;
         for i in 0..=steps {
             let t = i as f32 / steps as f32;
             self.plot(x0 + dx * t, y0 + dy * t, c, thick);

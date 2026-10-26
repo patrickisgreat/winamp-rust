@@ -25,6 +25,9 @@ pub enum Cmd {
     AddFiles,
     AddDirectory,
     AddUrl,
+    /// Play a URL immediately (appends it to the playlist).
+    PlayUrl(String),
+    QueueUrl(String),
     // windows
     ToggleMain,
     ToggleEq,
@@ -34,6 +37,7 @@ pub enum Cmd {
     TogglePlShade,
     ToggleDoubleSize,
     ToggleAlwaysOnTop,
+    ToggleLockWindows,
     MinimizeAll,
     Exit,
     // display
@@ -43,6 +47,11 @@ pub enum Cmd {
     ToggleAnalyzerStyle,
     ToggleAnalyzerPeaks,
     ToggleScrollTitle,
+    ToggleMilkdrop,
+    /// +1 next, -1 previous, 0 random.
+    MilkdropPreset(i32),
+    MilkdropSetPreset(usize),
+    MilkdropFullscreen,
     // equalizer
     ToggleEqEnabled,
     ToggleEqAuto,

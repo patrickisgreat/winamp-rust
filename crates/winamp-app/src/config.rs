@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use winamp_audio::EqSettings;
 
@@ -44,18 +45,28 @@ pub struct EqConfig {
 
 impl Default for EqConfig {
     fn default() -> Self {
-        Self { enabled: false, auto: false, preamp: 0.0, bands: [0.0; 10] }
+        Self {
+            enabled: false,
+            auto: false,
+            preamp: 0.0,
+            bands: [0.0; 10],
+        }
     }
 }
 
 impl EqConfig {
     pub fn to_settings(&self) -> EqSettings {
-        EqSettings { enabled: self.enabled, preamp_db: self.preamp, bands_db: self.bands }
+        EqSettings {
+            enabled: self.enabled,
+            preamp_db: self.preamp,
+            bands_db: self.bands,
+        }
     }
-    pub fn from_settings(&mut self, s: &EqSettings) {
-        self.enabled = s.enabled;
-        self.preamp = s.preamp_db;
-        self.bands = s.bands_db;
+    /// Remember the equalizer state the player currently has.
+    pub fn update_from(&mut self, settings: &EqSettings) {
+        self.enabled = settings.enabled;
+        self.preamp = settings.preamp_db;
+        self.bands = settings.bands_db;
     }
 }
 
@@ -69,13 +80,34 @@ pub struct Preset {
 
 impl Default for Preset {
     fn default() -> Self {
-        Self { name: String::new(), preamp: 0.0, bands: [0.0; 10] }
+        Self {
+            name: String::new(),
+            preamp: 0.0,
+            bands: [0.0; 10],
+        }
     }
 }
 
 impl Preset {
+    pub fn from_settings(name: impl Into<String>, settings: &EqSettings) -> Self {
+        Self {
+            name: name.into(),
+            preamp: settings.preamp_db,
+            bands: settings.bands_db,
+        }
+    }
+
+    /// Presets are always applied with the equalizer switched on.
     pub fn to_settings(&self) -> EqSettings {
-        EqSettings { enabled: true, preamp_db: self.preamp, bands_db: self.bands }
+        EqSettings {
+            enabled: true,
+            preamp_db: self.preamp,
+            bands_db: self.bands,
+        }
+    }
+
+    pub fn has_name(&self, name: &str) -> bool {
+        self.name.eq_ignore_ascii_case(name)
     }
 }
 
@@ -110,6 +142,8 @@ pub struct Config {
     pub pl_extra_rows: u32,
     pub scroll_title: bool,
     pub snap_windows: bool,
+    pub lock_windows: bool,
+    pub milkdrop_visible: bool,
     pub playlist_font_size: f32,
     pub read_tags_on_add: bool,
     pub show_bitrate_avg: bool,
@@ -144,6 +178,8 @@ impl Default for Config {
             pl_extra_rows: 0,
             scroll_title: true,
             snap_windows: true,
+            lock_windows: true,
+            milkdrop_visible: false,
             playlist_font_size: 9.0,
             read_tags_on_add: true,
             show_bitrate_avg: true,
@@ -169,44 +205,155 @@ pub fn playlist_path() -> PathBuf {
     config_dir().join("winamp.m3u8")
 }
 
-
 impl Config {
+    /// Load the settings file, falling back to defaults when it is missing
+    /// or unreadable (a broken file is logged, not fatal).
     pub fn load() -> Config {
-        let path = config_path();
-        match std::fs::read_to_string(&path) {
-            Ok(text) => match toml::from_str(&text) {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("config parse error ({}): {e}", path.display());
-                    Config::default()
-                }
-            },
-            Err(_) => Config::default(),
-        }
+        Self::load_from(&config_path())
     }
 
-    pub fn save(&self) {
-        let path = config_path();
+    fn load_from(path: &Path) -> Config {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Config::default();
+        };
+        toml::from_str(&text).unwrap_or_else(|e| {
+            log::warn!("config parse error ({}): {e}", path.display());
+            Config::default()
+        })
+    }
+
+    /// Write the settings file, creating the config and skins folders.
+    pub fn save(&self) -> Result<()> {
+        if let Err(e) = std::fs::create_dir_all(skins_dir()) {
+            log::warn!("creating skins folder: {e}");
+        }
+        self.save_to(&config_path())
+    }
+
+    fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        let _ = std::fs::create_dir_all(skins_dir());
-        match toml::to_string_pretty(self) {
-            Ok(text) => {
-                if let Err(e) = std::fs::write(&path, text) {
-                    log::warn!("saving config: {e}");
-                }
-            }
-            Err(e) => log::warn!("serialising config: {e}"),
-        }
+        let text = toml::to_string_pretty(self).context("serialising config")?;
+        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
     }
 
     pub fn find_preset(&self, name: &str) -> Option<&Preset> {
-        self.presets.iter().find(|p| p.name.eq_ignore_ascii_case(name))
+        self.presets.iter().find(|preset| preset.has_name(name))
     }
 
+    /// The per-file auto preset for `path`, matched on file name.
     pub fn auto_preset_for(&self, path: &Path) -> Option<&Preset> {
-        let key = path.file_name()?.to_string_lossy().to_string();
-        self.auto_presets.iter().find(|p| p.name.eq_ignore_ascii_case(&key))
+        let key = path.file_name()?.to_string_lossy();
+        self.auto_presets
+            .iter()
+            .find(|preset| preset.has_name(&key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_file(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("winamp-config-tests-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let path = temp_file("roundtrip/winamp.toml");
+        let mut config = Config {
+            volume: 0.42,
+            shuffle: true,
+            pl_extra_rows: 3,
+            ..Config::default()
+        };
+        config.presets.push(Preset {
+            name: "Mine".into(),
+            preamp: 1.5,
+            bands: [2.0; 10],
+        });
+        config.skin = Some(PathBuf::from("/skins/x.wsz"));
+        config.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path);
+        assert_eq!(loaded.volume, 0.42);
+        assert!(loaded.shuffle);
+        assert_eq!(loaded.pl_extra_rows, 3);
+        assert_eq!(loaded.presets[0].name, "Mine");
+        assert_eq!(loaded.skin.as_deref(), Some(Path::new("/skins/x.wsz")));
+    }
+
+    #[test]
+    fn missing_or_partial_files_fall_back_to_defaults() {
+        assert_eq!(
+            Config::load_from(Path::new("/no/such/winamp.toml")).volume,
+            Config::default().volume
+        );
+        let path = temp_file("partial.toml");
+        std::fs::write(
+            &path,
+            "volume = 0.1
+[eq]
+enabled = true
+",
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path);
+        assert_eq!(loaded.volume, 0.1);
+        assert!(loaded.eq.enabled);
+        assert!(
+            loaded.snap_windows,
+            "unspecified fields keep their defaults"
+        );
+        std::fs::write(&path, "this is = not [ toml").unwrap();
+        assert_eq!(
+            Config::load_from(&path).volume,
+            Config::default().volume,
+            "garbage is not fatal"
+        );
+    }
+
+    #[test]
+    fn presets_convert_to_and_from_player_settings() {
+        let settings = EqSettings {
+            enabled: false,
+            preamp_db: -3.0,
+            bands_db: [1.0; 10],
+        };
+        let preset = Preset::from_settings("Rock", &settings);
+        assert_eq!(preset.name, "Rock");
+        assert!(
+            preset.to_settings().enabled,
+            "applying a preset switches the EQ on"
+        );
+        assert_eq!(preset.to_settings().preamp_db, -3.0);
+        let mut eq_config = EqConfig::default();
+        eq_config.update_from(&settings);
+        assert_eq!(eq_config.to_settings(), settings);
+    }
+
+    #[test]
+    fn preset_lookup_ignores_case_and_matches_file_names() {
+        let config = Config {
+            presets: vec![Preset {
+                name: "Dance".into(),
+                ..Preset::default()
+            }],
+            auto_presets: vec![Preset {
+                name: "Song.MP3".into(),
+                ..Preset::default()
+            }],
+            ..Config::default()
+        };
+        assert!(config.find_preset("dance").is_some());
+        assert!(config.find_preset("rock").is_none());
+        assert!(config
+            .auto_preset_for(Path::new("/music/song.mp3"))
+            .is_some());
+        assert!(config
+            .auto_preset_for(Path::new("/music/other.mp3"))
+            .is_none());
     }
 }

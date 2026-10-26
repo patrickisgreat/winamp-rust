@@ -150,3 +150,32 @@ pub fn segment_mask(m: u8) -> Vec<bool> {
     }
     px
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_glyph_is_five_by_five_and_only_uses_hash_and_dot() {
+        let all = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\"@….:()-'!_+\\/[]^&%,=$#ÅÖÄ?*<> ";
+        for ch in all.chars() {
+            let glyph = glyph(ch).unwrap_or_else(|| panic!("missing glyph for {ch:?}"));
+            for row in glyph {
+                assert_eq!(row.len(), 5, "{ch:?}");
+                assert!(row.bytes().all(|b| b == b'#' || b == b'.'), "{ch:?}");
+            }
+        }
+        assert_eq!(glyph('a'), glyph('A'));
+        assert_eq!(glyph('é'), None);
+    }
+
+    #[test]
+    fn digit_masks_light_the_right_segment_count() {
+        // Each lit segment is 2 pixels thick (except the middle bar, 1 pixel).
+        let lit = |d: u32| digit_mask(d).iter().filter(|&&on| on).count();
+        assert!(lit(1) < lit(7) && lit(7) < lit(0) && lit(0) < lit(8));
+        assert_eq!(digit_mask(13), digit_mask(3), "wraps modulo 10");
+        assert_eq!(digit_mask(0).len(), 9 * 13);
+        assert_eq!(segment_mask(0).iter().filter(|&&on| on).count(), 0);
+    }
+}

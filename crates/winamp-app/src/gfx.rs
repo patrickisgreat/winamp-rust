@@ -16,8 +16,15 @@ impl Textures {
         let mut map = HashMap::new();
         for which in SkinImage::ALL {
             let img = skin.image(which);
-            let ci = ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
-            let tex = ctx.load_texture(format!("skin-{}", which.file_stem()), ci, TextureOptions::NEAREST);
+            let ci = ColorImage::from_rgba_unmultiplied(
+                [img.width() as usize, img.height() as usize],
+                img.as_raw(),
+            );
+            let tex = ctx.load_texture(
+                format!("skin-{}", which.file_stem()),
+                ci,
+                TextureOptions::NEAREST,
+            );
             map.insert(which, tex);
         }
         Self { map }
@@ -62,7 +69,8 @@ impl<'a> Gfx<'a> {
             Pos2::new(sp.x as f32 / size.x, sp.y as f32 / size.y),
             Pos2::new((sp.x + sp.w) as f32 / size.x, (sp.y + sp.h) as f32 / size.y),
         );
-        self.painter.image(tex.id(), self.rect(x, y, w, h), uv, Color32::WHITE);
+        self.painter
+            .image(tex.id(), self.rect(x, y, w, h), uv, Color32::WHITE);
     }
 
     /// Blit a horizontal slice of a sprite (used for clipping the marquee).
@@ -78,7 +86,12 @@ impl<'a> Gfx<'a> {
         let u1 = (sp.x as f32 + (visible.max.x - r.min.x) / self.scale) / size.x;
         let v0 = sp.y as f32 / size.y;
         let v1 = (sp.y + sp.h) as f32 / size.y;
-        self.painter.image(tex.id(), visible, Rect::from_min_max(Pos2::new(u0, v0), Pos2::new(u1, v1)), Color32::WHITE);
+        self.painter.image(
+            tex.id(),
+            visible,
+            Rect::from_min_max(Pos2::new(u0, v0), Pos2::new(u1, v1)),
+            Color32::WHITE,
+        );
     }
 
     /// Tile a sprite horizontally across `w` pixels.
@@ -96,7 +109,10 @@ impl<'a> Gfx<'a> {
         let mut cy = 0.0;
         while cy < h {
             let remaining = (h - cy).min(sp.h as f32);
-            let part = Sprite { h: remaining as u32, ..sp };
+            let part = Sprite {
+                h: remaining as u32,
+                ..sp
+            };
             self.sprite(part, x, y + cy);
             cy += sp.h as f32;
         }
@@ -130,10 +146,14 @@ impl<'a> Gfx<'a> {
         }
     }
 
-    pub fn digit(&self, x: f32, y: f32, d: u32) {
-        let img = if self.skin.has(SkinImage::NumsEx) { SkinImage::NumsEx } else { SkinImage::Numbers };
-        let img = if self.skin.has(SkinImage::Numbers) && !self.skin.has(SkinImage::NumsEx) { SkinImage::Numbers } else { img };
-        self.sprite(sprites::digit(img, d), x, y);
+    /// Draw one LCD digit, preferring the skin's own nums_ex.bmp.
+    pub fn digit(&self, x: f32, y: f32, digit: u32) {
+        let source = if self.skin.has(SkinImage::NumsEx) {
+            SkinImage::NumsEx
+        } else {
+            SkinImage::Numbers
+        };
+        self.sprite(sprites::digit(source, digit), x, y);
     }
 
     pub fn digit_blank(&self, x: f32, y: f32) {
@@ -150,12 +170,31 @@ impl<'a> Gfx<'a> {
 
     pub fn egui_text(&self, x: f32, y: f32, s: &str, size: f32, color: Color32) -> Rect {
         let pos = self.origin + Vec2::new(x * self.scale, y * self.scale);
-        self.painter.text(pos, egui::Align2::LEFT_TOP, s, egui::FontId::proportional(size * self.scale), color)
+        self.painter.text(
+            pos,
+            egui::Align2::LEFT_TOP,
+            s,
+            egui::FontId::proportional(size * self.scale),
+            color,
+        )
     }
 
-    pub fn egui_text_right(&self, right_x: f32, y: f32, s: &str, size: f32, color: Color32) -> Rect {
+    pub fn egui_text_right(
+        &self,
+        right_x: f32,
+        y: f32,
+        s: &str,
+        size: f32,
+        color: Color32,
+    ) -> Rect {
         let pos = self.origin + Vec2::new(right_x * self.scale, y * self.scale);
-        self.painter.text(pos, egui::Align2::RIGHT_TOP, s, egui::FontId::proportional(size * self.scale), color)
+        self.painter.text(
+            pos,
+            egui::Align2::RIGHT_TOP,
+            s,
+            egui::FontId::proportional(size * self.scale),
+            color,
+        )
     }
 }
 
@@ -170,7 +209,13 @@ pub struct PixelSurface {
 
 impl PixelSurface {
     pub fn new(name: &str, w: usize, h: usize) -> Self {
-        Self { w, h, img: ColorImage::new([w, h], Color32::BLACK), tex: None, name: name.to_string() }
+        Self {
+            w,
+            h,
+            img: ColorImage::new([w, h], Color32::BLACK),
+            tex: None,
+            name: name.to_string(),
+        }
     }
 
     pub fn clear(&mut self, c: Color32) {
@@ -194,12 +239,19 @@ impl PixelSurface {
     }
 
     pub fn draw(&mut self, ctx: &egui::Context, g: &Gfx, x: f32, y: f32) {
-        let img = self.img.clone();
-        match &mut self.tex {
-            Some(t) => t.set(img, TextureOptions::NEAREST),
-            None => self.tex = Some(ctx.load_texture(self.name.clone(), img, TextureOptions::NEAREST)),
-        }
-        let tex = self.tex.as_ref().unwrap();
+        // egui takes ownership of the uploaded image, so the surface keeps its own copy.
+        let upload = self.img.clone();
+        let tex = match &mut self.tex {
+            Some(tex) => {
+                tex.set(upload, TextureOptions::NEAREST);
+                tex
+            }
+            None => self.tex.insert(ctx.load_texture(
+                self.name.clone(),
+                upload,
+                TextureOptions::NEAREST,
+            )),
+        };
         g.painter.image(
             tex.id(),
             g.rect(x, y, self.w as f32, self.h as f32),
@@ -226,12 +278,19 @@ pub struct Mouse {
 impl Mouse {
     pub fn read(ctx: &egui::Context, scale: f32) -> Self {
         ctx.input(|i| Mouse {
-            pos: i.pointer.latest_pos().map(|p| Pos2::new(p.x / scale, p.y / scale)),
+            pos: i
+                .pointer
+                .latest_pos()
+                .map(|p| Pos2::new(p.x / scale, p.y / scale)),
             down: i.pointer.primary_down(),
             pressed: i.pointer.primary_pressed(),
             released: i.pointer.primary_released(),
             right_pressed: i.pointer.secondary_pressed(),
-            double_clicked: i.pointer.button_double_clicked(egui::PointerButton::Primary) || i.pointer.button_triple_clicked(egui::PointerButton::Primary),
+            double_clicked: i
+                .pointer
+                .button_double_clicked(egui::PointerButton::Primary)
+                || i.pointer
+                    .button_triple_clicked(egui::PointerButton::Primary),
             scroll: i.raw_scroll_delta.y,
             shift: i.modifiers.shift,
             ctrl: i.modifiers.command,
@@ -240,7 +299,9 @@ impl Mouse {
 
     pub fn over(&self, x: u32, y: u32, w: u32, h: u32) -> bool {
         match self.pos {
-            Some(p) => p.x >= x as f32 && p.x < (x + w) as f32 && p.y >= y as f32 && p.y < (y + h) as f32,
+            Some(p) => {
+                p.x >= x as f32 && p.x < (x + w) as f32 && p.y >= y as f32 && p.y < (y + h) as f32
+            }
             None => false,
         }
     }
@@ -250,5 +311,48 @@ impl Mouse {
             Some(p) => p.x >= x && p.x < x + w && p.y >= y && p.y < y + h,
             None => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mouse_hit_testing_uses_half_open_ranges() {
+        let mouse = Mouse {
+            pos: Some(Pos2::new(10.0, 20.0)),
+            ..Mouse::default()
+        };
+        assert!(mouse.over(10, 20, 1, 1));
+        assert!(
+            !mouse.over(11, 20, 5, 5),
+            "left edge is inclusive, so x=10 misses a box starting at 11"
+        );
+        assert!(!mouse.over(5, 15, 5, 5), "right/bottom edges are exclusive");
+        assert!(mouse.over_f(9.5, 19.5, 1.0, 1.0));
+        assert!(!Mouse::default().over(0, 0, 100, 100), "no pointer, no hit");
+    }
+
+    #[test]
+    fn pixel_surface_ignores_out_of_bounds_writes() {
+        let mut surface = PixelSurface::new("test", 4, 3);
+        surface.px(-1, 0, Color32::RED);
+        surface.px(4, 0, Color32::RED);
+        surface.px(0, 3, Color32::RED);
+        assert!(surface.img.pixels.iter().all(|&p| p == Color32::BLACK));
+        surface.vline(1, 2, 0, Color32::RED);
+        assert_eq!(
+            surface
+                .img
+                .pixels
+                .iter()
+                .filter(|&&p| p == Color32::RED)
+                .count(),
+            3,
+            "vline accepts reversed ends"
+        );
+        surface.clear(Color32::WHITE);
+        assert!(surface.img.pixels.iter().all(|&p| p == Color32::WHITE));
     }
 }

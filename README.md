@@ -155,6 +155,11 @@ Preferences > Hotkeys. On macOS the Command key works wherever Ctrl is listed.
   ripping, the mini-browser, `region.txt` non-rectangular windows, skin
   cursors, tag editing in the file info dialog.
 
+## Developer docs
+
+Architecture, the audio engine, the UI model, skins and the development
+workflow are documented in [`docs/`](docs/README.md).
+
 ## Layout
 
 * `crates/winamp-audio`: decoding, streaming, resampling, EQ, output, FFT.
